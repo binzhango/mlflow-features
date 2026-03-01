@@ -18,6 +18,7 @@ from .chat_payloads import (
 )
 from .context import get_trace_context
 from .mlflow_sink import MLflowSink
+from .model_config import MODEL_CONFIG_KEYS, extract_model_config
 from .schema import SpanRecord
 
 
@@ -78,9 +79,12 @@ class InstrumentedLLMClient:
     def _start_span(self, *, operation: str, payload: Any, call_kwargs: dict[str, Any]) -> dict[str, Any]:
         ctx = get_trace_context()
         metadata = self._metadata_from_kwargs(call_kwargs=call_kwargs)
+        model_config = extract_model_config(self._client_model_config_defaults(), metadata, call_kwargs)
         span_id = str(uuid4())
         trace_id = ctx.trace_id or span_id
         inputs_payload = build_chat_request(payload)
+        if model_config:
+            inputs_payload = {**inputs_payload, **model_config}
         prompt_text = request_preview_text(inputs_payload)
         attrs: dict[str, Any] = {
             "prompt_hash": self._hash(prompt_text),
@@ -89,6 +93,9 @@ class InstrumentedLLMClient:
         }
         if self._sink.config.log_content:
             attrs["prompt_text"] = prompt_text
+        if model_config:
+            attrs["model_config"] = model_config
+            attrs.update(self._flatten_metadata(model_config, prefix="model_config"))
 
         span = SpanRecord(
             trace_id=trace_id,
@@ -112,6 +119,7 @@ class InstrumentedLLMClient:
         return {
             "span": span,
             "start_time_ns": time.perf_counter_ns(),
+            "model_config": model_config or None,
         }
 
     def _end_ok_span(self, start: dict[str, Any], result: Any, *, streamed: bool) -> None:
@@ -134,6 +142,9 @@ class InstrumentedLLMClient:
         if response_metadata:
             attrs["response_metadata"] = response_metadata
             attrs.update(self._flatten_metadata(response_metadata, prefix="response_metadata"))
+        if start.get("model_config"):
+            attrs["model_config"] = start["model_config"]
+            attrs.update(self._flatten_metadata(start["model_config"], prefix="model_config"))
         if additional_kwargs := self._extract_additional_kwargs(result):
             attrs["additional_kwargs"] = additional_kwargs
         usage_metadata = getattr(result, "usage_metadata", None)
@@ -168,6 +179,10 @@ class InstrumentedLLMClient:
         self._sink.end_span(span)
 
     def _end_error_span(self, start: dict[str, Any], error: BaseException) -> None:
+        attrs: dict[str, Any] = {}
+        if start.get("model_config"):
+            attrs["model_config"] = start["model_config"]
+            attrs.update(self._flatten_metadata(start["model_config"], prefix="model_config"))
         span = SpanRecord(
             trace_id=start["span"].trace_id,
             span_id=start["span"].span_id,
@@ -186,6 +201,7 @@ class InstrumentedLLMClient:
             latency_ms=(time.perf_counter_ns() - start["start_time_ns"]) / 1_000_000,
             error_type=type(error).__name__,
             error_message=str(error),
+            attributes=attrs,
         )
         self._sink.end_span(span)
 
@@ -276,6 +292,14 @@ class InstrumentedLLMClient:
     def _gateway_route(self) -> str | None:
         route = getattr(self._client, "gateway_route", None)
         return str(route) if route else None
+
+    def _client_model_config_defaults(self) -> dict[str, Any]:
+        defaults: dict[str, Any] = {}
+        for key in MODEL_CONFIG_KEYS:
+            value = getattr(self._client, key, None)
+            if value is not None:
+                defaults[key] = value
+        return defaults
 
     @staticmethod
     def _to_text(payload: Any) -> str:

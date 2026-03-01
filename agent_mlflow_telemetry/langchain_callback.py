@@ -21,6 +21,7 @@ from .chat_payloads import (
 )
 from .context import get_trace_context
 from .mlflow_sink import MLflowSink
+from .model_config import extract_model_config, extract_model_config_from_serialized_repr
 from .schema import SpanRecord
 
 
@@ -37,6 +38,7 @@ class _ActiveRun:
     model_name: str | None = None
     gateway_route: str | None = None
     endpoint: str | None = None
+    model_config: dict[str, Any] | None = None
     session_id: str | None = None
     root_request_id: str | None = None
     user_id: str | None = None
@@ -141,6 +143,14 @@ class TelemetryCallbackHandler(BaseCallbackHandler):
             or self._first_non_empty(metadata, ("gateway_route", "route", "path"))
         )
         endpoint = self._endpoint(invocation_params=invocation_params, metadata=metadata)
+        model_config = extract_model_config(
+            extract_model_config_from_serialized_repr(serialized.get("repr")),
+            metadata,
+            invocation_params,
+        )
+        if component == "llm" and model_config and isinstance(input_payload, dict):
+            input_payload = {**input_payload, **model_config}
+            prompt_text = request_preview_text(input_payload)
         session_id = ctx.session_id or self._first_non_empty(
             metadata,
             ("session_id", "conversation_id", "thread_id", "chat_id"),
@@ -163,6 +173,7 @@ class TelemetryCallbackHandler(BaseCallbackHandler):
             model_name=model_name,
             gateway_route=gateway_route,
             endpoint=endpoint,
+            model_config=model_config or None,
             session_id=session_id,
             root_request_id=root_request_id,
             user_id=user_id,
@@ -177,6 +188,9 @@ class TelemetryCallbackHandler(BaseCallbackHandler):
         if component == "llm":
             attrs["_mlflow_inputs"] = input_payload
             attrs["mlflow.message.format"] = "openai"
+            if model_config:
+                attrs["model_config"] = model_config
+                attrs.update(self._flatten_metadata(model_config, prefix="model_config"))
 
         span = SpanRecord(
             trace_id=start.trace_id,
@@ -227,6 +241,13 @@ class TelemetryCallbackHandler(BaseCallbackHandler):
                     response_metadata=response_metadata,
                 )
                 response_text = response_preview_text(output_payload)
+            elif start.component == "chain":
+                output_payload = build_chat_outputs(
+                    payload,
+                    default_role="assistant",
+                    model_name=start.model_name,
+                )
+                response_text = response_preview_text(output_payload)
             else:
                 response_text = self._to_text(payload)
         else:
@@ -245,6 +266,9 @@ class TelemetryCallbackHandler(BaseCallbackHandler):
             attributes["mlflow.message.format"] = "openai"
             attributes["mlflow.chat.messages"] = output_payload.get("messages", [])
         if start.component == "llm":
+            if start.model_config:
+                attributes["model_config"] = start.model_config
+                attributes.update(self._flatten_metadata(start.model_config, prefix="model_config"))
             if response_metadata:
                 attributes["response_metadata"] = response_metadata
                 attributes.update(self._flatten_metadata(response_metadata, prefix="response_metadata"))

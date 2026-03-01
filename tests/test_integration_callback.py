@@ -59,7 +59,12 @@ def test_callback_creates_trace_tree_and_populates_llm_metrics() -> None:
         ["hello"],
         run_id=llm_run,
         parent_run_id=chain_run,
-        invocation_params={"model": "glm-4.7-flash", "gateway_route": "/gateway"},
+        invocation_params={
+            "model": "glm-4.7-flash",
+            "gateway_route": "/gateway",
+            "temperature": 0.2,
+            "reasoning": {"effort": "high"},
+        },
     )
     cb.on_llm_end(
         _Resp(
@@ -80,6 +85,8 @@ def test_callback_creates_trace_tree_and_populates_llm_metrics() -> None:
     started_chain, started_llm = sink.started
     assert started_chain.span_id == str(chain_run)
     assert started_llm.parent_span_id == str(chain_run)
+    assert started_llm.attributes["_mlflow_inputs"]["temperature"] == 0.2
+    assert started_llm.attributes["_mlflow_inputs"]["reasoning_effort"] == "high"
 
     ended_llm = [s for s in sink.ended if s.span_id == str(llm_run)][0]
     assert ended_llm.input_tokens == 4
@@ -90,6 +97,8 @@ def test_callback_creates_trace_tree_and_populates_llm_metrics() -> None:
     assert ended_llm.latency_ms is not None and ended_llm.latency_ms >= 0
     assert "response_metadata" in ended_llm.attributes
     assert ended_llm.attributes["response_metadata.model_name"] == "glm-4.7-flash"
+    assert ended_llm.attributes["model_config.temperature"] == 0.2
+    assert ended_llm.attributes["model_config.reasoning_effort"] == "high"
     outputs = ended_llm.attributes["_mlflow_outputs"]
     assert outputs["messages"] == [{"role": "assistant", "content": "world"}]
     assert outputs["model"] == "glm-4.7-flash"
@@ -258,3 +267,50 @@ def test_callback_uses_upstream_trace_context_for_root_span() -> None:
 
     assert sink.started[0].trace_id == "upstream-trace"
     assert sink.started[0].parent_span_id == "upstream-parent"
+
+
+def test_chain_outputs_are_chat_formatted_for_plain_response_preview() -> None:
+    sink = RecordingSink()
+    cb = TelemetryCallbackHandler(sink=sink)
+    run_id = uuid4()
+
+    cb.on_chain_start({"name": "root"}, {"input": "x"}, run_id=run_id, parent_run_id=None)
+    cb.on_chain_end("In Boston it is 6C and cloudy.", run_id=run_id, parent_run_id=None)
+
+    ended = sink.ended[0]
+    assert ended.attributes["response_text"] == "In Boston it is 6C and cloudy."
+    assert ended.attributes["_mlflow_outputs"]["messages"] == [
+        {"role": "assistant", "content": "In Boston it is 6C and cloudy."}
+    ]
+    assert ended.attributes["mlflow.chat.messages"][0]["content"] == "In Boston it is 6C and cloudy."
+
+
+def test_callback_extracts_model_config_from_serialized_repr() -> None:
+    sink = RecordingSink()
+    cb = TelemetryCallbackHandler(sink=sink)
+    llm_run = uuid4()
+
+    cb.on_llm_start(
+        {
+            "name": "ChatOllama",
+            "repr": "ChatOllama(model='nemotron-3-nano', temperature=0.4, reasoning={'effort': 'high'})",
+        },
+        ["hello"],
+        run_id=llm_run,
+        parent_run_id=None,
+        invocation_params={"model": "nemotron-3-nano"},
+    )
+    cb.on_llm_end(
+        _Resp(
+            generations=[[_Gen(text="world")]],
+            llm_output={},
+        ),
+        run_id=llm_run,
+        parent_run_id=None,
+    )
+
+    ended = sink.ended[0]
+    assert ended.attributes["model_config.temperature"] == 0.4
+    assert ended.attributes["model_config.reasoning_effort"] == "high"
+    assert sink.started[0].attributes["_mlflow_inputs"]["temperature"] == 0.4
+    assert sink.started[0].attributes["_mlflow_inputs"]["reasoning_effort"] == "high"

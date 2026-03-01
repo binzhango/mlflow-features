@@ -107,12 +107,12 @@ def test_instrumented_client_sync_and_stream_emit_spans() -> None:
     sink = RecordingSink()
     wrapped = InstrumentedLLMClient(client, sink)
 
-    sync_result = wrapped.invoke("hello", temperature=0)
+    sync_result = wrapped.invoke("hello", temperature=0, reasoning={"effort": "medium"})
     stream_result = list(wrapped.stream("hello", stream=True))
 
     assert isinstance(sync_result, _Resp)
     assert stream_result == ["c1", "c2"]
-    assert client.calls[0] == ("invoke", ("hello",), {"temperature": 0})
+    assert client.calls[0] == ("invoke", ("hello",), {"temperature": 0, "reasoning": {"effort": "medium"}})
     assert client.calls[1] == ("stream", ("hello",), {"stream": True})
 
     assert len(sink.started) == 2
@@ -123,6 +123,10 @@ def test_instrumented_client_sync_and_stream_emit_spans() -> None:
     assert sink.ended[0].total_tokens == 5
     assert sink.ended[0].attributes["response_metadata"] == {"model_name": "glm-4.7-flash"}
     assert sink.ended[0].attributes["response_metadata.model_name"] == "glm-4.7-flash"
+    assert sink.ended[0].attributes["model_config.temperature"] == 0
+    assert sink.ended[0].attributes["model_config.reasoning_effort"] == "medium"
+    assert sink.started[0].attributes["_mlflow_inputs"]["temperature"] == 0
+    assert sink.started[0].attributes["_mlflow_inputs"]["reasoning_effort"] == "medium"
     assert sink.ended[0].attributes["additional_kwargs"] == {"finish_reason": "stop"}
     assert sink.ended[0].attributes["usage_metadata"] == {
         "input_tokens": 2,

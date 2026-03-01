@@ -26,6 +26,17 @@ export AGENT_TELEMETRY_SERVICE_VERSION=0.1.0
 export AGENT_TELEMETRY_ENVIRONMENT=dev
 ```
 
+## Run MLflow Server
+```bash
+chmod +x scripts/run_mlflow_server.sh
+./scripts/run_mlflow_server.sh
+```
+
+Optional overrides:
+```bash
+MLFLOW_HOST=0.0.0.0 MLFLOW_PORT=5001 ./scripts/run_mlflow_server.sh
+```
+
 ## Register Callback (LangChain Path)
 ```python
 from langchain_ollama import ChatOllama
@@ -64,6 +75,18 @@ UV_CACHE_DIR=.uv-cache uv run python examples/chat_ollama_reference.py
 
 If local Ollama is not running or `glm-4.7-flash` is not pulled, the example prints an actionable error instead of crashing silently.
 
+## Run Tool-Call UI Demo
+This demo does not require a live LLM. It emits a deterministic trace with a child tool-call span:
+
+```bash
+AGENT_TELEMETRY_MLFLOW_TRACKING_URI=http://127.0.0.1:5000 \
+UV_CACHE_DIR=.uv-cache uv run python examples/tool_call_span_ui_demo.py
+```
+
+After it runs, verify in MLflow UI that:
+- a child span named `tool_call.function.lookup_weather` is present under the first LLM span.
+- the LLM span attributes include `model_config.temperature` and `model_config.reasoning_effort`.
+
 ## Telemetry Behaviors
 - Span lifecycle: start/end/event write path through `MLflowSink`
 - Retry: bounded retry on transient failures
@@ -84,3 +107,6 @@ If local Ollama is not running or `glm-4.7-flash` is not pulled, the example pri
 ```bash
 UV_CACHE_DIR=.uv-cache uv run pytest -q
 ```
+
+## Guides
+- Span/UI customization guide: [`docs/customize-trace-spans-ui.md`](docs/customize-trace-spans-ui.md)
