@@ -2,11 +2,12 @@ import pytest
 
 from agent_mlflow_telemetry.bootstrap import (
     TelemetryRuntime,
+    build_custom_langchain_tracer,
     build_langchain_callback,
     initialize_telemetry,
 )
 from agent_mlflow_telemetry.config import TelemetryConfig
-from agent_mlflow_telemetry.langchain_callback import TelemetryCallbackHandler
+from agent_mlflow_telemetry.langchain_callback import CustomLangchainTracer, TelemetryCallbackHandler
 from agent_mlflow_telemetry.mlflow_sink import MLflowSink
 from agent_mlflow_telemetry.schema import SpanRecord
 
@@ -80,6 +81,10 @@ def test_initialize_runtime_and_build_callback_wires_sink() -> None:
     cb = build_langchain_callback(runtime)
     assert isinstance(cb, TelemetryCallbackHandler)
     assert cb._sink is runtime.sink
+
+    tracer = build_custom_langchain_tracer(runtime)
+    assert isinstance(tracer, CustomLangchainTracer)
+    assert tracer._sink is runtime.sink
 
 
 def test_sink_noop_methods_do_not_raise() -> None:

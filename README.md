@@ -5,7 +5,6 @@ Custom MLflow tracing adapter for LangChain-style agent telemetry when `langchai
 ## Environment
 - Python: `3.12`
 - Package manager: `uv`
-- Core model path for this project: `ChatOllama(model="glm-4.7-flash")`
 
 ## Install
 ```bash
@@ -51,8 +50,28 @@ config = TelemetryConfig.from_env()
 runtime = initialize_telemetry(config)
 callback = build_langchain_callback(runtime)
 
-model = ChatOllama(model="glm-4.7-flash", temperature=0)
+model = ChatOllama(model="nemotron-3-nano", temperature=0)
 response = model.invoke("hello", config={"callbacks": [callback]})
+```
+
+## Autolog-Style Global Tracer (No Per-Invoke Callback)
+```python
+from langchain_ollama import ChatOllama
+
+from agent_mlflow_telemetry import TelemetryConfig, autolog
+
+runtime = autolog(config=TelemetryConfig.from_env())
+
+model = ChatOllama(model="nemotron-3-nano", temperature=0)
+response = model.invoke("hello")
+```
+
+If needed, disable global injection later:
+
+```python
+from agent_mlflow_telemetry import disable_autolog
+
+disable_autolog()
 ```
 
 ## Adapt `llmclient` as ChatModel
@@ -62,7 +81,7 @@ from langchain_ollama import ChatOllama
 from agent_mlflow_telemetry import TelemetryConfig, initialize_telemetry, wrap_llmclient
 
 runtime = initialize_telemetry(TelemetryConfig.from_env())
-client = ChatOllama(model="glm-4.7-flash")
+client = ChatOllama(model="nemotron-3-nano", temperature=0)
 instrumented = wrap_llmclient(client, runtime.sink)
 
 result = instrumented.invoke("hello")
@@ -73,7 +92,20 @@ result = instrumented.invoke("hello")
 UV_CACHE_DIR=.uv-cache uv run python examples/chat_ollama_reference.py
 ```
 
-If local Ollama is not running or `glm-4.7-flash` is not pulled, the example prints an actionable error instead of crashing silently.
+If local Ollama is not running or `nemotron-3-nano` is not pulled, the example prints an actionable error instead of crashing silently.
+
+## Run Autolog Verification Example
+This example uses `ChatOllama` and verifies `CHAT_MODEL` traces for both `invoke()` and `ainvoke()` without `mlflow.start_run()`:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python examples/autolog_verification.py
+```
+
+Optional model override:
+
+```bash
+OLLAMA_MODEL=nemotron-3-nano UV_CACHE_DIR=.uv-cache uv run python examples/autolog_verification.py
+```
 
 ## Run Tool-Call UI Demo
 This demo does not require a live LLM. It emits a deterministic trace with a child tool-call span:

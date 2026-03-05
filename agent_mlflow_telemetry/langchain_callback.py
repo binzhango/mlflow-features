@@ -7,9 +7,14 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from typing import Callable
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
+from mlflow.entities import LiveSpan
+from mlflow.entities import SpanType
+from mlflow.langchain.langchain_tracer import MlflowLangchainTracer
+from mlflow.tracing.constant import SpanAttributeKey
 
 from .chat_payloads import (
     build_chat_outputs,
@@ -570,3 +575,107 @@ class TelemetryCallbackHandler(BaseCallbackHandler):
 
         _walk(metadata, prefix)
         return flat
+
+
+class CustomLangchainTracer(MlflowLangchainTracer):
+    """
+    MLflow-compatible custom LangChain tracer.
+
+    This intentionally subclasses `MlflowLangchainTracer` so it can be used with
+    the same autolog callback injection pattern as official MLflow LangChain tracing.
+    """
+
+    def __init__(
+        self,
+        *,
+        sink: MLflowSink | None = None,
+        static_attributes: dict[str, Any] | None = None,
+        span_processor: Callable[[LiveSpan, dict[str, Any]], None] | None = None,
+        prediction_context: Any | None = None,
+        run_inline: bool = False,
+    ) -> None:
+        super().__init__(prediction_context=prediction_context, run_inline=run_inline)
+        # Backward-compat only: legacy bootstrap passes runtime.sink.
+        self._sink = sink
+        self._static_attributes = dict(static_attributes or {})
+        self._span_processor = span_processor
+
+    def _start_span(
+        self,
+        span_name: str,
+        parent_run_id: Any,
+        span_type: str,
+        run_id: Any,
+        inputs: str | dict[str, Any] | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> LiveSpan:
+        attrs = dict(attributes or {})
+        normalized_inputs = inputs
+        if span_type in (SpanType.CHAT_MODEL, SpanType.LLM):
+            normalized_inputs = build_chat_request(inputs)
+            attrs[SpanAttributeKey.MESSAGE_FORMAT] = "openai"
+
+        span = super()._start_span(
+            span_name=span_name,
+            parent_run_id=parent_run_id,
+            span_type=span_type,
+            run_id=run_id,
+            inputs=normalized_inputs,
+            attributes=attrs,
+        )
+        for key, value in self._static_attributes.items():
+            span.set_attribute(key, value)
+        if self._span_processor is not None:
+            self._span_processor(
+                span,
+                {
+                    "span_name": span_name,
+                    "span_type": span_type,
+                    "run_id": str(run_id),
+                    "parent_run_id": str(parent_run_id) if parent_run_id is not None else None,
+                },
+            )
+        return span
+
+    def _end_span(
+        self,
+        run_id: Any,
+        span: LiveSpan,
+        outputs: Any = None,
+        attributes: dict[str, Any] | None = None,
+        status: Any = None,
+    ) -> None:
+        attrs = dict(attributes or {})
+        normalized_outputs = outputs
+
+        if span.span_type in (SpanType.CHAT_MODEL, SpanType.LLM) and outputs is not None:
+            token_usage = TelemetryCallbackHandler._extract_token_usage(outputs)
+            response_metadata = TelemetryCallbackHandler._extract_response_metadata(outputs)
+            model_name = span.attributes.get(SpanAttributeKey.MODEL)
+            model_name_text = str(model_name) if model_name else None
+            normalized_outputs = build_chat_outputs(
+                outputs,
+                default_role="assistant",
+                model_name=model_name_text,
+                token_usage=token_usage,
+                response_metadata=response_metadata,
+            )
+            attrs[SpanAttributeKey.MESSAGE_FORMAT] = "openai"
+            attrs["mlflow.chat.messages"] = normalized_outputs.get("messages", [])
+
+        if status is None:
+            super()._end_span(
+                run_id=run_id,
+                span=span,
+                outputs=normalized_outputs,
+                attributes=attrs or None,
+            )
+            return
+
+        super()._end_span(
+            run_id=run_id,
+            span=span,
+            outputs=normalized_outputs,
+            attributes=attrs or None,
+            status=status,
+        )

@@ -68,7 +68,7 @@ def main() -> None:
                 )
                 print("wrapped invoke response:", getattr(wrapped_response, "content", wrapped_response))
     except Exception as exc:  # noqa: BLE001
-        print("Example run failed. Ensure Ollama is running and model glm-4.7-flash is available.")
+        print("Example run failed. Ensure Ollama is running and model nemotron-3-nano is available.")
         print(f"Error: {exc}")
 
 
