@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import pytest
 
 from agent_mlflow_telemetry.config import TelemetryConfig
-from agent_mlflow_telemetry.langchain_callback import TelemetryCallbackHandler
 from agent_mlflow_telemetry.llmclient_adapter import InstrumentedLLMClient, wrap_llmclient
 from agent_mlflow_telemetry.schema import SpanRecord
 
@@ -87,14 +86,6 @@ class DummyToolCallClient:
             ],
             response_metadata={"model_name": "nemotron-3-nano", "done_reason": "tool_call"},
         )
-
-
-def test_callback_methods_without_run_id_are_safe_noops() -> None:
-    handler = TelemetryCallbackHandler(sink=RecordingSink())
-
-    assert handler.on_chain_start({"id": "chain"}, {"input": "x"}) is None
-    assert handler.on_chain_end({"output": "y"}) is None
-    assert handler.on_chain_error(RuntimeError("boom")) is None
 
 
 def test_wrap_llmclient_returns_instrumented_wrapper() -> None:

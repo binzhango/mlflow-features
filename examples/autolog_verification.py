@@ -1,4 +1,4 @@
-"""Verify autolog-style LangChain tracing with ChatOllama.
+"""Verify autolog-only tracing with ChatOllama.
 
 Run:
     UV_CACHE_DIR=.uv-cache uv run python examples/autolog_verification.py
@@ -27,11 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent_mlflow_telemetry import (  # noqa: E402
-    TelemetryConfig,
-    autolog,
-    disable_autolog,
-)
+from agent_mlflow_telemetry import TelemetryConfig, autolog, disable_autolog  # noqa: E402
 
 
 def _tracking_uri() -> str | None:
@@ -99,8 +95,7 @@ def main() -> int:
         environment=os.getenv("ENVIRONMENT", "dev"),
     )
 
-    runtime = autolog(config=cfg)
-    if runtime is None:
+    if autolog(config=cfg) is None:
         print("Failed to enable autolog.")
         return 1
 
@@ -111,6 +106,7 @@ def main() -> int:
         sync_prompt = f"Reply with exactly: telemetry-ready sync-{sync_marker}"
         async_prompt = f"Reply with exactly: telemetry-ready async-{async_marker}"
 
+        # No callbacks and no mlflow.start_run() on purpose: this validates autolog path.
         sync_response = model.invoke(sync_prompt)
         print("invoke response:", getattr(sync_response, "content", sync_response))
 
@@ -145,7 +141,7 @@ def main() -> int:
             print(f"{mode} trace verified: trace_id={trace.info.trace_id}")
             print("chat spans:", [span.name for span in chat_spans])
 
-        print("Autolog verification passed for both invoke() and ainvoke().")
+        print("Autolog check passed (invoke + ainvoke).")
         return 0
     except Exception as exc:  # noqa: BLE001
         print("Autolog verification failed.")

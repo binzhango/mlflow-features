@@ -28,7 +28,7 @@ from agent_mlflow_telemetry import (  # noqa: E402
     initialize_telemetry,
     with_trace_context,
 )
-from agent_mlflow_telemetry.langchain_callback import TelemetryCallbackHandler  # noqa: E402
+from agent_mlflow_telemetry.langchain_callback import CustomLangchainTracer  # noqa: E402
 
 
 @dataclass
@@ -56,7 +56,7 @@ def _tracking_uri() -> str | None:
     return os.getenv("AGENT_TELEMETRY_MLFLOW_TRACKING_URI") or os.getenv("MLFLOW_TRACKING_URI")
 
 
-def _emit_trace(*, callback: TelemetryCallbackHandler, question: str) -> None:
+def _emit_trace(*, callback: CustomLangchainTracer, question: str) -> None:
     chain_run_id = uuid4()
     llm_plan_run_id = uuid4()
     tool_exec_run_id = uuid4()

@@ -7,7 +7,7 @@ from agent_mlflow_telemetry.bootstrap import (
     initialize_telemetry,
 )
 from agent_mlflow_telemetry.config import TelemetryConfig
-from agent_mlflow_telemetry.langchain_callback import CustomLangchainTracer, TelemetryCallbackHandler
+from agent_mlflow_telemetry.langchain_callback import CustomLangchainTracer
 from agent_mlflow_telemetry.mlflow_sink import MLflowSink
 from agent_mlflow_telemetry.schema import SpanRecord
 
@@ -79,7 +79,7 @@ def test_initialize_runtime_and_build_callback_wires_sink() -> None:
     assert runtime.sink._config is cfg
 
     cb = build_langchain_callback(runtime)
-    assert isinstance(cb, TelemetryCallbackHandler)
+    assert isinstance(cb, CustomLangchainTracer)
     assert cb._sink is runtime.sink
 
     tracer = build_custom_langchain_tracer(runtime)

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from .config import TelemetryConfig
-from .langchain_callback import CustomLangchainTracer, TelemetryCallbackHandler
+from .langchain_callback import CustomLangchainTracer
 from .mlflow_sink import MLflowSink
 
 
@@ -22,10 +22,10 @@ def initialize_telemetry(config: TelemetryConfig) -> TelemetryRuntime:
     return TelemetryRuntime(config=config, sink=sink)
 
 
-def build_langchain_callback(runtime: TelemetryRuntime) -> TelemetryCallbackHandler:
+def build_langchain_callback(runtime: TelemetryRuntime) -> CustomLangchainTracer:
     """Build LangChain callback handler from runtime."""
 
-    return TelemetryCallbackHandler(sink=runtime.sink)
+    return CustomLangchainTracer(sink=runtime.sink)
 
 
 def build_custom_langchain_tracer(runtime: TelemetryRuntime) -> CustomLangchainTracer:

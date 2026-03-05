@@ -107,6 +107,13 @@ Optional model override:
 OLLAMA_MODEL=nemotron-3-nano UV_CACHE_DIR=.uv-cache uv run python examples/autolog_verification.py
 ```
 
+## Run Tool Autolog Verification Example
+This example binds a tool to `ChatOllama`, runs in autolog mode, and checks that `tool_call.*` spans are present:
+
+```bash
+OLLAMA_MODEL=nemotron-3-nano UV_CACHE_DIR=.uv-cache uv run python examples/tool_autolog_verification.py
+```
+
 ## Run Tool-Call UI Demo
 This demo does not require a live LLM. It emits a deterministic trace with a child tool-call span:
 
