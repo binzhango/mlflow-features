@@ -66,6 +66,72 @@ from mlflow_langchain_enrichment import TraceContext, invoke_with_enrichment
 - `request_preview_builder` / `response_preview_builder`: custom preview logic
 - `span_metadata`: extra LangChain `RunnableConfig.metadata`
 - `trace_name`: sets LangChain `run_name` when one is not already provided
+- `mlflow_run_name`: optional associated MLflow Run name for the UI `Run name` column
+- `run_tags`: optional tags for the associated MLflow Run
+- `run_description`: optional description for the associated MLflow Run
+- `ensure_run`: start an MLflow Run at the request boundary if none is active
+
+## Minimum-change integration
+
+If your app already calls `chain.invoke(...)` or `await chain.ainvoke(...)` directly, you do not need to replace those call sites.
+
+Use the global hook once at startup:
+
+```python
+from mlflow_langchain_enrichment import enable_mlflow_langchain_enrichment
+
+mlflow.langchain.autolog()
+enable_mlflow_langchain_enrichment()
+```
+
+Then set request-scoped trace context around the existing application flow:
+
+```python
+from mlflow_langchain_enrichment import using_trace_context
+
+with using_trace_context(
+    user_id=user_id,
+    session_id=session_id,
+    tags={"app": "support-bot", "route": route_name},
+    metadata={"deployment": "prod"},
+):
+    result = chain.invoke(payload)
+```
+
+The `invoke(...)` call is unchanged. The enrichment callback is injected through LangChain's callback manager automatically.
+
+If the UI `Run name` column is empty, that means the trace is not associated with an MLflow Run. In MLflow, that column comes from the active `mlflow.start_run(...)` context, not from the trace name. To populate it with minimum change, let `using_trace_context(...)` open a run for the request:
+
+```python
+with using_trace_context(
+    user_id=user_id,
+    session_id=session_id,
+    mlflow_run_name=f"chat-{session_id}",
+    ensure_run=True,
+    tags={"app": "support-bot", "route": route_name},
+):
+    result = chain.invoke(payload)
+```
+
+If there is already an active MLflow Run, `using_trace_context(...)` leaves it alone.
+
+If you already have request context stored elsewhere, you can avoid even the `with` block and register a provider:
+
+```python
+from mlflow_langchain_enrichment import enable_mlflow_langchain_enrichment, TraceContext
+
+def current_trace_context() -> TraceContext:
+    return TraceContext(
+        user_id=request_state.user_id,
+        session_id=request_state.session_id,
+        tags={"app": "support-bot", "route": request_state.route},
+        metadata={"deployment": "prod"},
+    )
+
+enable_mlflow_langchain_enrichment(current_trace_context)
+```
+
+After that, existing `invoke(...)` and `ainvoke(...)` paths pick up enrichment automatically whenever the provider returns a context.
 
 ## Local MLflow + Ollama example
 
@@ -117,6 +183,8 @@ print(result.content)
 ```
 
 The full runnable script is in [examples/local_ollama_mlflow.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/local_ollama_mlflow.py).
+
+An auto-integration example that keeps `chain.invoke(...)` unchanged is in [examples/local_ollama_auto_enrichment_mlflow.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/local_ollama_auto_enrichment_mlflow.py).
 
 ## Tool-calling trace example
 
@@ -200,6 +268,7 @@ tags.environment = 'dev'
 
 - package code: `src/mlflow_langchain_enrichment/`
 - example: `examples/local_ollama_mlflow.py`
+- auto example: `examples/local_ollama_auto_enrichment_mlflow.py`
 - tool-calling example: `examples/local_ollama_tool_calling_mlflow.py`
 - mlflow server script: `scripts/start_mlflow_server.sh`
 - tests: `tests/test_enrichment.py`

@@ -129,9 +129,13 @@ class TraceContext:
     tags: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
     span_metadata: Mapping[str, Any] = field(default_factory=dict)
+    run_tags: Mapping[str, Any] = field(default_factory=dict)
     user_id: str | None = None
     session_id: str | None = None
     client_request_id: str | None = None
+    mlflow_run_name: str | None = None
+    run_description: str | None = None
+    ensure_run: bool = False
     request_preview: str | None = None
     response_preview: str | None = None
     request_preview_builder: PreviewBuilder | None = None
@@ -279,7 +283,8 @@ def build_invoke_config(
     built = dict(config or {})
 
     callbacks = list(built.get("callbacks", []))
-    callbacks.append(TraceEnrichmentCallback(trace_context))
+    if not any(isinstance(callback, TraceEnrichmentCallback) for callback in callbacks):
+        callbacks.append(TraceEnrichmentCallback(trace_context))
     built["callbacks"] = callbacks
 
     metadata = dict(built.get("metadata", {}))

@@ -9,16 +9,42 @@ from mlflow_langchain_enrichment import (
     build_invoke_config,
     default_request_preview,
     default_response_preview,
+    disable_mlflow_langchain_enrichment,
+    enable_mlflow_langchain_enrichment,
     invoke_with_enrichment,
+    set_current_trace_context,
 )
+from langchain_core.callbacks.manager import CallbackManager
+
+from mlflow_langchain_enrichment.auto import reset_current_trace_context, using_trace_context
 
 
 class _FakeMlflow:
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.started_runs: list[dict] = []
+        self._active_run = None
 
     def update_current_trace(self, **kwargs):
         self.calls.append(kwargs)
+
+    def active_run(self):
+        return self._active_run
+
+    def start_run(self, **kwargs):
+        self.started_runs.append(kwargs)
+        self._active_run = object()
+        fake_mlflow = self
+
+        class _RunContext:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                fake_mlflow._active_run = None
+                return False
+
+        return _RunContext()
 
 
 class _FakeRunnable:
@@ -38,6 +64,7 @@ class EnrichmentTests(unittest.TestCase):
         sys.modules["mlflow"] = self.fake_mlflow
 
     def tearDown(self) -> None:
+        disable_mlflow_langchain_enrichment()
         if self.original_mlflow is None:
             sys.modules.pop("mlflow", None)
         else:
@@ -94,6 +121,14 @@ class EnrichmentTests(unittest.TestCase):
         self.assertEqual(config["callbacks"][0], "existing")
         self.assertEqual(type(config["callbacks"][1]).__name__, "TraceEnrichmentCallback")
 
+    def test_build_invoke_config_dedupes_existing_trace_callback(self) -> None:
+        existing = TraceEnrichmentCallback(TraceContext())
+        config = build_invoke_config(
+            TraceContext(),
+            {"callbacks": [existing]},
+        )
+        self.assertEqual(config["callbacks"], [existing])
+
     def test_invoke_with_enrichment_passes_built_config(self) -> None:
         runnable = _FakeRunnable({"answer": "ok"})
 
@@ -108,6 +143,57 @@ class EnrichmentTests(unittest.TestCase):
         self.assertEqual(runnable.last_config["metadata"]["route"], "support")
         self.assertEqual(runnable.last_config["metadata"]["tenant"], "acme")
         self.assertEqual(type(runnable.last_config["callbacks"][0]).__name__, "TraceEnrichmentCallback")
+
+    def test_auto_enrichment_injects_callback_from_contextvar(self) -> None:
+        enable_mlflow_langchain_enrichment()
+        token = set_current_trace_context(TraceContext(tags={"feature": "auto"}))
+        try:
+            manager = CallbackManager.configure()
+        finally:
+            reset_current_trace_context(token)
+
+        self.assertTrue(
+            any(isinstance(handler, TraceEnrichmentCallback) for handler in manager.handlers)
+        )
+
+    def test_auto_enrichment_uses_provider(self) -> None:
+        enable_mlflow_langchain_enrichment(
+            lambda: {
+                "tags": {"feature": "provider"},
+                "user_id": "user-7",
+            }
+        )
+        manager = CallbackManager.configure()
+        callback = next(
+            handler for handler in manager.handlers if isinstance(handler, TraceEnrichmentCallback)
+        )
+
+        self.assertEqual(callback.trace_context.tags["feature"], "provider")
+        self.assertEqual(callback.trace_context.user_id, "user-7")
+
+    def test_using_trace_context_can_start_mlflow_run(self) -> None:
+        with using_trace_context(
+            ensure_run=True,
+            mlflow_run_name="support-request-run",
+            run_tags={"team": "support"},
+            trace_name="trace-name",
+        ):
+            self.assertIsNotNone(self.fake_mlflow.active_run())
+
+        self.assertEqual(len(self.fake_mlflow.started_runs), 1)
+        self.assertEqual(self.fake_mlflow.started_runs[0]["run_name"], "support-request-run")
+        self.assertEqual(self.fake_mlflow.started_runs[0]["tags"]["team"], "support")
+
+    def test_using_trace_context_does_not_start_nested_mlflow_run(self) -> None:
+        self.fake_mlflow._active_run = object()
+
+        with using_trace_context(
+            ensure_run=True,
+            mlflow_run_name="ignored",
+        ):
+            self.assertIsNotNone(self.fake_mlflow.active_run())
+
+        self.assertEqual(self.fake_mlflow.started_runs, [])
 
 
 if __name__ == "__main__":
