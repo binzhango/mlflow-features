@@ -7,6 +7,7 @@ from mlflow.entities import SpanType
 from mlflow.langchain.langchain_tracer import MlflowLangchainTracer
 from mlflow.tracing.constant import SpanAttributeKey
 
+from agent_mlflow_telemetry.config import TelemetryConfig
 from agent_mlflow_telemetry.langchain_callback import CustomLangchainTracer
 
 
@@ -42,6 +43,19 @@ class _Gen:
 class _Resp:
     generations: list[list[_Gen]]
     llm_output: dict[str, object]
+
+
+class _RecordingSink:
+    def __init__(self) -> None:
+        self.config = TelemetryConfig()
+        self.started: list[object] = []
+        self.ended: list[object] = []
+
+    def start_span(self, span) -> None:  # noqa: ANN001
+        self.started.append(span)
+
+    def end_span(self, span) -> None:  # noqa: ANN001
+        self.ended.append(span)
 
 
 def test_custom_tracer_enriches_llm_start_attributes(monkeypatch) -> None:
@@ -191,3 +205,41 @@ def test_custom_tracer_enriches_llm_end_and_emits_tool_call_spans(monkeypatch) -
     assert child["span"].ended[0]["attributes"]["tool_call_id"] == "call_1"
     assert child["span"].ended[0]["outputs"]["tool_call"]["function"]["name"] == "lookup_weather"
     assert str(run_id) not in tracer._run_state
+
+
+def test_custom_tracer_emits_tool_call_spans_via_sink_when_present() -> None:
+    sink = _RecordingSink()
+    tracer = CustomLangchainTracer(sink=sink, run_inline=True)
+    parent_span = _FakeSpan(
+        span_type=SpanType.CHAT_MODEL,
+        attributes={},
+    )
+    parent_span.trace_id = "trace-1"
+    parent_span.span_id = "parent-1"
+    response = _Resp(
+        generations=[
+            [
+                _Gen(
+                    message=_Msg(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "lookup_weather", "arguments": "{\"city\":\"Boston\"}"},
+                            }
+                        ],
+                    )
+                )
+            ]
+        ],
+        llm_output={},
+    )
+
+    tracer._emit_tool_call_spans(parent_span=parent_span, payload=response)
+
+    assert len(sink.started) == 1
+    assert len(sink.ended) == 1
+    assert sink.started[0].component == "tool"
+    assert sink.started[0].parent_span_id == "parent-1"
+    assert sink.ended[0].attributes["tool_call_name"] == "lookup_weather"

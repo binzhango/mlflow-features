@@ -5,7 +5,12 @@ from dataclasses import dataclass
 import pytest
 
 from agent_mlflow_telemetry.config import TelemetryConfig
-from agent_mlflow_telemetry.llmclient_adapter import InstrumentedLLMClient, wrap_llmclient
+from agent_mlflow_telemetry.llmclient_adapter import (
+    InstrumentedLLMClient,
+    TelemetryEnabledClient,
+    create_telemetry_client,
+    wrap_llmclient,
+)
 from agent_mlflow_telemetry.schema import SpanRecord
 
 
@@ -91,6 +96,12 @@ class DummyToolCallClient:
 def test_wrap_llmclient_returns_instrumented_wrapper() -> None:
     wrapped = wrap_llmclient(DummyOllamaClient(), RecordingSink())
     assert isinstance(wrapped, InstrumentedLLMClient)
+    assert isinstance(wrapped, TelemetryEnabledClient)
+
+
+def test_create_telemetry_client_returns_telemetry_wrapper() -> None:
+    wrapped = create_telemetry_client(DummyOllamaClient(), RecordingSink())
+    assert isinstance(wrapped, TelemetryEnabledClient)
 
 
 def test_instrumented_client_sync_and_stream_emit_spans() -> None:

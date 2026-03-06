@@ -1,6 +1,6 @@
-"""Backward-compatible re-export for chat model client instrumentation."""
+"""Chat model client wrapper integration."""
 
-from .integrations.chat_model.client import (
+from .client import (
     InstrumentedLLMClient,
     TelemetryEnabledClient,
     create_telemetry_client,

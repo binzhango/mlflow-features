@@ -1,9 +1,11 @@
 import pytest
 
 from agent_mlflow_telemetry.bootstrap import (
+    TelemetryClient,
     TelemetryRuntime,
     build_custom_langchain_tracer,
     build_langchain_callback,
+    create_langchain_tracer,
     initialize_telemetry,
 )
 from agent_mlflow_telemetry.config import TelemetryConfig
@@ -74,6 +76,7 @@ def test_initialize_runtime_and_build_callback_wires_sink() -> None:
     runtime = initialize_telemetry(cfg)
 
     assert isinstance(runtime, TelemetryRuntime)
+    assert isinstance(runtime, TelemetryClient)
     assert runtime.config is cfg
     assert isinstance(runtime.sink, MLflowSink)
     assert runtime.sink._config is cfg
@@ -81,6 +84,10 @@ def test_initialize_runtime_and_build_callback_wires_sink() -> None:
     cb = build_langchain_callback(runtime)
     assert isinstance(cb, CustomLangchainTracer)
     assert cb._sink is runtime.sink
+
+    canonical = create_langchain_tracer(runtime)
+    assert isinstance(canonical, CustomLangchainTracer)
+    assert canonical._sink is runtime.sink
 
     tracer = build_custom_langchain_tracer(runtime)
     assert isinstance(tracer, CustomLangchainTracer)

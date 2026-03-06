@@ -1,6 +1,6 @@
-"""Backward-compatible re-export for runtime bootstrap helpers."""
+"""Runtime configuration/context/bootstrap layer."""
 
-from .runtime.bootstrap import (
+from .bootstrap import (
     TelemetryClient,
     TelemetryRuntime,
     build_custom_langchain_tracer,
@@ -8,8 +8,18 @@ from .runtime.bootstrap import (
     create_langchain_tracer,
     initialize_telemetry,
 )
+from .config import TelemetryConfig
+from .context import (
+    TraceContext,
+    get_trace_context,
+    with_trace_context,
+)
 
 __all__ = [
+    "TelemetryConfig",
+    "TraceContext",
+    "get_trace_context",
+    "with_trace_context",
     "TelemetryClient",
     "TelemetryRuntime",
     "initialize_telemetry",
