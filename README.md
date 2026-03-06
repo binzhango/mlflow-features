@@ -100,6 +100,28 @@ with using_trace_context(
 
 The `invoke(...)` call is unchanged. The enrichment callback is injected through LangChain's callback manager automatically.
 
+If your team prefers explicit open/close calls instead of a `with` block, use:
+
+```python
+from mlflow_langchain_enrichment import close_trace_context, open_trace_context
+
+handle = open_trace_context(
+    user_id=user_id,
+    session_id=session_id,
+    mlflow_run_name=f"chat-{session_id}",
+    ensure_run=True,
+    tags={"app": "support-bot", "route": route_name},
+)
+try:
+    result = chain.invoke(payload)
+finally:
+    close_trace_context(handle)
+```
+
+That has the same behavior as `using_trace_context(...)`: it sets the request-scoped trace context and closes any MLflow Run that it opened.
+
+A runnable verification script for this explicit style is in [verify_open_close_trace_context.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/verify_open_close_trace_context.py).
+
 If the UI `Run name` column is empty, that means the trace is not associated with an MLflow Run. In MLflow, that column comes from the active `mlflow.start_run(...)` context, not from the trace name. To populate it with minimum change, let `using_trace_context(...)` open a run for the request:
 
 ```python

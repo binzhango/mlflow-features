@@ -7,11 +7,14 @@ from mlflow_langchain_enrichment import (
     TraceContext,
     TraceEnrichmentCallback,
     build_invoke_config,
+    close_trace_context,
     default_request_preview,
     default_response_preview,
     disable_mlflow_langchain_enrichment,
     enable_mlflow_langchain_enrichment,
+    get_current_trace_context,
     invoke_with_enrichment,
+    open_trace_context,
     set_current_trace_context,
 )
 from langchain_core.callbacks.manager import CallbackManager
@@ -194,6 +197,35 @@ class EnrichmentTests(unittest.TestCase):
             self.assertIsNotNone(self.fake_mlflow.active_run())
 
         self.assertEqual(self.fake_mlflow.started_runs, [])
+
+    def test_open_and_close_trace_context_manage_state(self) -> None:
+        handle = open_trace_context(
+            user_id="user-9",
+            ensure_run=True,
+            mlflow_run_name="manual-open-close",
+        )
+        try:
+            self.assertEqual(handle.trace_context.user_id, "user-9")
+            self.assertIsNotNone(self.fake_mlflow.active_run())
+            self.assertEqual(get_current_trace_context().user_id, "user-9")
+        finally:
+            close_trace_context(handle)
+
+        self.assertIsNone(self.fake_mlflow.active_run())
+        self.assertIsNone(get_current_trace_context())
+
+    def test_open_and_close_trace_context_restore_previous_context(self) -> None:
+        outer = set_current_trace_context(TraceContext(user_id="outer"))
+        try:
+            handle = open_trace_context(user_id="inner")
+            try:
+                self.assertEqual(handle.trace_context.user_id, "inner")
+                self.assertEqual(get_current_trace_context().user_id, "inner")
+            finally:
+                close_trace_context(handle)
+            self.assertEqual(get_current_trace_context().user_id, "outer")
+        finally:
+            reset_current_trace_context(outer)
 
 
 if __name__ == "__main__":

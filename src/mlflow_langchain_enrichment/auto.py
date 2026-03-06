@@ -4,6 +4,7 @@ import contextlib
 import contextvars
 import threading
 import warnings
+from dataclasses import dataclass
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
@@ -24,6 +25,13 @@ _PATCHED = False
 _TRACE_CONTEXT_PROVIDER: TraceContextProvider | None = None
 _ORIGINAL_CALLBACK_CONFIGURE: Callable[..., CallbackManager] | None = None
 _ORIGINAL_ASYNC_CALLBACK_CONFIGURE: Callable[..., AsyncCallbackManager] | None = None
+
+
+@dataclass(slots=True)
+class TraceContextHandle:
+    trace_context: TraceContext
+    token: contextvars.Token[TraceContext | None]
+    exit_stack: contextlib.ExitStack
 
 
 def _coerce_trace_context(trace_context: TraceContextLike) -> TraceContext | None:
@@ -52,21 +60,29 @@ def reset_current_trace_context(token: contextvars.Token[TraceContext | None]) -
     _CURRENT_TRACE_CONTEXT.reset(token)
 
 
-@contextlib.contextmanager
-def using_trace_context(
+def _build_trace_context(
     trace_context: TraceContextLike = None,
     /,
     **trace_context_kwargs: Any,
-) -> Iterator[TraceContext]:
+) -> TraceContext:
     if trace_context is not None and trace_context_kwargs:
         raise ValueError("Pass either a TraceContext object or keyword fields, not both.")
 
     resolved = _coerce_trace_context(trace_context)
     if resolved is None:
         resolved = TraceContext(**trace_context_kwargs)
+    return resolved
 
+
+def open_trace_context(
+    trace_context: TraceContextLike = None,
+    /,
+    **trace_context_kwargs: Any,
+) -> TraceContextHandle:
+    resolved = _build_trace_context(trace_context, **trace_context_kwargs)
     token = set_current_trace_context(resolved)
-    run_context = contextlib.nullcontext()
+    exit_stack = contextlib.ExitStack()
+
     try:
         if (
             resolved.ensure_run
@@ -77,16 +93,43 @@ def using_trace_context(
             import mlflow
 
             if mlflow.active_run() is None:
-                run_context = mlflow.start_run(
-                    run_name=resolved.mlflow_run_name or resolved.trace_name,
-                    tags=dict(resolved.run_tags) or None,
-                    description=resolved.run_description,
+                exit_stack.enter_context(
+                    mlflow.start_run(
+                        run_name=resolved.mlflow_run_name or resolved.trace_name,
+                        tags=dict(resolved.run_tags) or None,
+                        description=resolved.run_description,
+                    )
                 )
 
-        with run_context:
-            yield resolved
-    finally:
+        return TraceContextHandle(
+            trace_context=resolved,
+            token=token,
+            exit_stack=exit_stack,
+        )
+    except Exception:
+        exit_stack.close()
         reset_current_trace_context(token)
+        raise
+
+
+def close_trace_context(handle: TraceContextHandle) -> None:
+    try:
+        handle.exit_stack.close()
+    finally:
+        reset_current_trace_context(handle.token)
+
+
+@contextlib.contextmanager
+def using_trace_context(
+    trace_context: TraceContextLike = None,
+    /,
+    **trace_context_kwargs: Any,
+) -> Iterator[TraceContext]:
+    handle = open_trace_context(trace_context, **trace_context_kwargs)
+    try:
+        yield handle.trace_context
+    finally:
+        close_trace_context(handle)
 
 
 def _resolve_trace_context() -> TraceContext | None:
