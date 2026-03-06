@@ -144,6 +144,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local MLflow state
+.mlflow/
+
 # Spyder project settings
 .spyderproject
 .spyproject
