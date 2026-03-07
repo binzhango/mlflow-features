@@ -146,6 +146,7 @@ venv.bak/
 
 # Local MLflow state
 .mlflow/
+mlflow.db
 
 # Spyder project settings
 .spyderproject

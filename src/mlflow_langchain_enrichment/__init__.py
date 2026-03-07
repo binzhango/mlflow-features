@@ -1,12 +1,16 @@
 from .auto import (
+    RootTraceHandle,
     TraceContextHandle,
+    close_root_trace,
     close_trace_context,
     disable_mlflow_langchain_enrichment,
     enable_mlflow_langchain_enrichment,
     get_current_trace_context,
+    open_root_trace,
     open_trace_context,
     reset_current_trace_context,
     set_current_trace_context,
+    using_root_trace,
     using_trace_context,
 )
 from .enrichment import (
@@ -21,11 +25,13 @@ from .enrichment import (
 )
 
 __all__ = [
+    "RootTraceHandle",
     "TraceContext",
     "TraceContextHandle",
     "TraceEnrichmentCallback",
     "ainvoke_with_enrichment",
     "build_invoke_config",
+    "close_root_trace",
     "close_trace_context",
     "disable_mlflow_langchain_enrichment",
     "default_request_preview",
@@ -33,9 +39,11 @@ __all__ = [
     "enable_mlflow_langchain_enrichment",
     "get_current_trace_context",
     "invoke_with_enrichment",
+    "open_root_trace",
     "open_trace_context",
     "reset_current_trace_context",
     "set_current_trace_context",
+    "using_root_trace",
     "using_trace_context",
     "update_trace_from_context",
 ]

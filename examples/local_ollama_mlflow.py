@@ -6,7 +6,7 @@ import mlflow
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
-from mlflow_langchain_enrichment import TraceContext, invoke_with_enrichment
+from mlflow_langchain_enrichment import TraceContext, invoke_with_enrichment, using_trace_context
 
 
 def main() -> None:
@@ -20,7 +20,9 @@ def main() -> None:
             ("human", "{question}"),
         ]
     )
-    chain = (prompt | ChatOllama(model="nemotron-3-nano", temperature=0)).with_config(
+    llm = ChatOllama(model="nemotron-3-nano", temperature=0)
+
+    chain = (prompt | llm).with_config(
         {"run_name": "support-assistant"}
     )
 
@@ -51,6 +53,30 @@ def main() -> None:
         trace_context,
         config={"metadata": {"route": "billing"}},
     )
+
+    print(result.content)
+
+
+    with using_trace_context(
+        user_id="user-42",
+        session_id="session-20260306-001",
+        client_request_id="req-20260306-abc",
+        mlflow_run_name="support-auto-enrichment-run",
+        ensure_run=True,
+        # tags={
+        #     "app": "support-bot",
+        #     "environment": "dev",
+        #     "feature": "auto-enrichment",
+        # },
+        # metadata={
+        #     "app_version": "0.1.0",
+        #     "deployment": "local-mlflow-server",
+        # },
+        # run_tags={"team": "support"},
+        span_metadata={"tenant": "local-demo", "provider": "ollama"},
+        trace_name="support-auto-enrichment",
+    ):
+        result = llm.invoke({"question": "Why was invoice INV-42 charged twice?"})
 
     print(result.content)
 

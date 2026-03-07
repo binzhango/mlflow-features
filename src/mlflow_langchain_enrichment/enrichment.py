@@ -26,6 +26,74 @@ def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, default=str, separators=(",", ":"))
 
 
+def to_span_io(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): to_span_io(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [to_span_io(item) for item in value]
+
+    content = getattr(value, "content", None)
+    if isinstance(content, str):
+        return {"content": content}
+
+    generations = getattr(value, "generations", None)
+    if isinstance(generations, list) and generations:
+        first_generation = generations[0]
+        if isinstance(first_generation, list) and first_generation:
+            text = getattr(first_generation[0], "text", None)
+            if isinstance(text, str):
+                return {"content": text}
+
+    return {"value": _compact_json(value)}
+
+
+def to_root_span_inputs(request: Any) -> Any:
+    return to_span_io(request)
+
+
+def to_root_span_outputs(response: Any) -> Any:
+    content = getattr(response, "content", None)
+    response_metadata = getattr(response, "response_metadata", None)
+    usage_metadata = getattr(response, "usage_metadata", None)
+    tool_calls = getattr(response, "tool_calls", None)
+    additional_kwargs = getattr(response, "additional_kwargs", None)
+    name = getattr(response, "name", None)
+    message_id = getattr(response, "id", None)
+
+    if (
+        isinstance(content, str)
+        or response_metadata is not None
+        or usage_metadata is not None
+        or tool_calls is not None
+        or additional_kwargs
+    ):
+        payload: dict[str, Any] = {}
+        if isinstance(content, str):
+            payload["content"] = content
+        if response_metadata is not None:
+            payload["response_metadata"] = to_span_io(response_metadata)
+        if usage_metadata is not None:
+            payload["usage_metadata"] = to_span_io(usage_metadata)
+        if tool_calls is not None:
+            payload["tool_calls"] = to_span_io(tool_calls)
+        if additional_kwargs:
+            payload["additional_kwargs"] = to_span_io(additional_kwargs)
+        if name is not None:
+            payload["name"] = name
+        if message_id is not None:
+            payload["id"] = message_id
+        return payload
+
+    return to_span_io(response)
+
+
 def _normalize_mapping(value: Mapping[str, Any] | None) -> dict[str, str]:
     if not value:
         return {}
@@ -142,6 +210,7 @@ class TraceContext:
     response_preview_builder: PreviewBuilder | None = None
     preview_limit: int = DEFAULT_PREVIEW_LENGTH
     trace_name: str | None = None
+    capture_root_span_io: bool = True
 
     def trace_metadata(self) -> dict[str, str]:
         metadata = _normalize_mapping(self.metadata)

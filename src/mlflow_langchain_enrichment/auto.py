@@ -10,7 +10,14 @@ from typing import Any
 
 from langchain_core.callbacks.manager import AsyncCallbackManager, CallbackManager
 
-from .enrichment import TraceContext, TraceEnrichmentCallback
+from .enrichment import (
+    TraceContext,
+    TraceEnrichmentCallback,
+    to_root_span_inputs,
+    to_root_span_outputs,
+    to_span_io,
+    update_trace_from_context,
+)
 
 
 TraceContextLike = TraceContext | Mapping[str, Any] | None
@@ -32,6 +39,17 @@ class TraceContextHandle:
     trace_context: TraceContext
     token: contextvars.Token[TraceContext | None]
     exit_stack: contextlib.ExitStack
+
+
+@dataclass(slots=True)
+class RootTraceHandle:
+    trace_context: TraceContext
+    trace_context_handle: TraceContextHandle
+    span: Any
+    exit_stack: contextlib.ExitStack
+    request: Any = None
+    response: Any = None
+    error: BaseException | None = None
 
 
 def _coerce_trace_context(trace_context: TraceContextLike) -> TraceContext | None:
@@ -119,6 +137,81 @@ def close_trace_context(handle: TraceContextHandle) -> None:
         reset_current_trace_context(handle.token)
 
 
+def open_root_trace(
+    trace_context: TraceContextLike = None,
+    /,
+    **trace_context_kwargs: Any,
+) -> RootTraceHandle:
+    resolved = _build_trace_context(trace_context, **trace_context_kwargs)
+    trace_context_handle = open_trace_context(resolved)
+    exit_stack = contextlib.ExitStack()
+
+    try:
+        import mlflow
+
+        span = exit_stack.enter_context(
+            mlflow.start_span(name=resolved.trace_name or "request")
+        )
+        update_trace_from_context(resolved)
+        return RootTraceHandle(
+            trace_context=resolved,
+            trace_context_handle=trace_context_handle,
+            span=span,
+            exit_stack=exit_stack,
+        )
+    except Exception:
+        exit_stack.close()
+        close_trace_context(trace_context_handle)
+        raise
+
+
+def close_root_trace(
+    handle: RootTraceHandle,
+    *,
+    request: Any = None,
+    response: Any = None,
+    error: BaseException | None = None,
+) -> None:
+    try:
+        final_request = request if request is not None else handle.request
+        final_error = error if error is not None else handle.error
+        final_response = response if response is not None else handle.response
+
+        if final_request is not None and handle.trace_context.capture_root_span_io:
+            handle.span.set_inputs(to_root_span_inputs(final_request))
+
+        if final_error is not None:
+            if handle.trace_context.capture_root_span_io:
+                handle.span.set_outputs(
+                    {"error": f"{type(final_error).__name__}: {final_error}"}
+                )
+            update_trace_from_context(
+                handle.trace_context,
+                request=final_request,
+                response=f"{type(final_error).__name__}: {final_error}",
+                state="ERROR",
+            )
+        elif final_response is not None:
+            if handle.trace_context.capture_root_span_io:
+                handle.span.set_outputs(to_root_span_outputs(final_response))
+            update_trace_from_context(
+                handle.trace_context,
+                request=final_request,
+                response=final_response,
+                state="OK",
+            )
+        elif final_request is not None:
+            update_trace_from_context(
+                handle.trace_context,
+                request=final_request,
+            )
+    finally:
+        try:
+            handle.exit_stack.close()
+        finally:
+            close_trace_context(handle.trace_context_handle)
+
+
 @contextlib.contextmanager
 def using_trace_context(
     trace_context: TraceContextLike = None,
@@ -130,6 +223,30 @@ def using_trace_context(
         yield handle.trace_context
     finally:
         close_trace_context(handle)
+
+
+@contextlib.contextmanager
+def using_root_trace(
+    trace_context: TraceContextLike = None,
+    /,
+    **trace_context_kwargs: Any,
+) -> Iterator[RootTraceHandle]:
+    handle = open_root_trace(trace_context, **trace_context_kwargs)
+    try:
+        yield handle
+    except BaseException as exc:
+        handle.error = exc
+        close_root_trace(handle)
+        raise
+    else:
+        close_root_trace(handle)
+
+
+# Backward-compatible aliases for older code paths.
+ManualRootTraceHandle = RootTraceHandle
+open_manual_root_trace = open_root_trace
+close_manual_root_trace = close_root_trace
+using_manual_root_trace = using_root_trace
 
 
 def _resolve_trace_context() -> TraceContext | None:

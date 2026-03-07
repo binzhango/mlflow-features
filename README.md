@@ -122,6 +122,35 @@ That has the same behavior as `using_trace_context(...)`: it sets the request-sc
 
 A runnable verification script for this explicit style is in [verify_open_close_trace_context.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/verify_open_close_trace_context.py).
 
+For async load testing with unchanged `ainvoke(...)` calls, see [async_load_test_trace_context.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/async_load_test_trace_context.py). It sends 10 concurrent requests grouped across `session-1` (`3` requests), `session-2` (`3` requests), and `session-3` (`4` requests) so you can verify session isolation in the trace UI.
+
+If async task-local tracing is still inconsistent in your environment, use [threaded_load_test_trace_context.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/threaded_load_test_trace_context.py) instead. It runs the same `10` requests with the same `3/3/4` session split using threads, which is typically more reliable for MLflow autolog trace isolation than concurrent `ainvoke(...)` tasks.
+
+To test whether newer MLflow async tracing fixes are sufficient in your environment, see [async_manual_root_trace_load_test.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/async_manual_root_trace_load_test.py). That example creates one root trace per async request, sets `mlflow.trace.session` directly on the root trace, and then calls `await chain.ainvoke(...)` under concurrent load.
+
+For FastAPI-style async handlers, you can simplify that pattern with the new manual-root-trace helpers:
+
+```python
+from mlflow_langchain_enrichment import using_root_trace
+
+async def traced_request(chain, payload, session_id, user_id, request_id):
+    with using_root_trace(
+        user_id=user_id,
+        session_id=session_id,
+        client_request_id=request_id,
+        trace_name=f"chat-{session_id}",
+    ) as trace:
+        trace.request = payload
+        result = await chain.ainvoke(payload)
+        trace.response = result
+        return result
+```
+
+By default, this writes request/response previews to the trace UI but does not duplicate full inputs/outputs onto the manual root span. If you explicitly want root-span inputs/outputs too, pass `capture_root_span_io=True`.
+By default, this writes request/response previews to the trace UI and also sets normalized `Inputs` / `Outputs` on the manual root span so the request span in UI is complete. If you want the root span to stay as a pure envelope, pass `capture_root_span_io=False`.
+
+If your team prefers explicit lifecycle control instead of a `with` block, the package also exports `open_root_trace(...)` and `close_root_trace(...)`.
+
 If the UI `Run name` column is empty, that means the trace is not associated with an MLflow Run. In MLflow, that column comes from the active `mlflow.start_run(...)` context, not from the trace name. To populate it with minimum change, let `using_trace_context(...)` open a run for the request:
 
 ```python

@@ -4,9 +4,11 @@ import sys
 import unittest
 
 from mlflow_langchain_enrichment import (
+    RootTraceHandle,
     TraceContext,
     TraceEnrichmentCallback,
     build_invoke_config,
+    close_root_trace,
     close_trace_context,
     default_request_preview,
     default_response_preview,
@@ -14,8 +16,10 @@ from mlflow_langchain_enrichment import (
     enable_mlflow_langchain_enrichment,
     get_current_trace_context,
     invoke_with_enrichment,
+    open_root_trace,
     open_trace_context,
     set_current_trace_context,
+    using_root_trace,
 )
 from langchain_core.callbacks.manager import CallbackManager
 
@@ -27,6 +31,7 @@ class _FakeMlflow:
         self.calls: list[dict] = []
         self.started_runs: list[dict] = []
         self._active_run = None
+        self.started_spans: list[dict] = []
 
     def update_current_trace(self, **kwargs):
         self.calls.append(kwargs)
@@ -48,6 +53,28 @@ class _FakeMlflow:
                 return False
 
         return _RunContext()
+
+    def start_span(self, **kwargs):
+        self.started_spans.append(kwargs)
+        fake_mlflow = self
+
+        class _SpanContext:
+            def __enter__(self_inner):
+                self_inner.inputs = None
+                self_inner.outputs = None
+                fake_mlflow.started_spans[-1]["context"] = self_inner
+                return self_inner
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+            def set_inputs(self_inner, inputs):
+                self_inner.inputs = inputs
+
+            def set_outputs(self_inner, outputs):
+                self_inner.outputs = outputs
+
+        return _SpanContext()
 
 
 class _FakeRunnable:
@@ -226,6 +253,59 @@ class EnrichmentTests(unittest.TestCase):
             self.assertEqual(get_current_trace_context().user_id, "outer")
         finally:
             reset_current_trace_context(outer)
+
+    def test_open_root_trace_starts_root_span(self) -> None:
+        handle = open_root_trace(
+            user_id="user-10",
+            session_id="session-10",
+            trace_name="manual-root-test",
+        )
+        try:
+            self.assertIsInstance(handle, RootTraceHandle)
+            self.assertEqual(self.fake_mlflow.started_spans[0]["name"], "manual-root-test")
+            self.assertEqual(
+                self.fake_mlflow.calls[0]["metadata"]["mlflow.trace.session"],
+                "session-10",
+            )
+        finally:
+            close_root_trace(handle)
+
+    def test_using_root_trace_records_error_state(self) -> None:
+        with self.assertRaisesRegex(ValueError, "boom"):
+            with using_root_trace(
+                user_id="user-11",
+                session_id="session-11",
+            ):
+                raise ValueError("boom")
+
+        self.assertEqual(self.fake_mlflow.calls[-1]["state"], "ERROR")
+
+    def test_using_root_trace_records_response_state(self) -> None:
+        with using_root_trace(
+            user_id="user-12",
+            session_id="session-12",
+        ) as handle:
+            handle.request = {"question": "hello"}
+            handle.response = {"answer": "done"}
+
+        self.assertEqual(self.fake_mlflow.calls[-1]["state"], "OK")
+        self.assertEqual(self.fake_mlflow.calls[-1]["response_preview"], "done")
+        span = self.fake_mlflow.started_spans[-1]["context"]
+        self.assertEqual(span.inputs, {"question": "hello"})
+        self.assertEqual(span.outputs, {"answer": "done"})
+
+    def test_using_root_trace_can_disable_root_span_io(self) -> None:
+        with using_root_trace(
+            user_id="user-13",
+            session_id="session-13",
+            capture_root_span_io=False,
+        ) as handle:
+            handle.request = {"question": "hello"}
+            handle.response = {"answer": "done"}
+
+        span = self.fake_mlflow.started_spans[-1]["context"]
+        self.assertIsNone(span.inputs)
+        self.assertIsNone(span.outputs)
 
 
 if __name__ == "__main__":
