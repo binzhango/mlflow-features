@@ -4,26 +4,31 @@ import sys
 import unittest
 
 from mlflow_langchain_enrichment import (
-    RootTraceHandle,
     TraceContext,
-    TraceEnrichmentCallback,
-    build_invoke_config,
     close_root_trace,
     close_trace_context,
-    default_request_preview,
-    default_response_preview,
-    disable_mlflow_langchain_enrichment,
     enable_mlflow_langchain_enrichment,
     get_current_trace_context,
     invoke_with_enrichment,
     open_root_trace,
     open_trace_context,
-    set_current_trace_context,
     using_root_trace,
 )
 from langchain_core.callbacks.manager import CallbackManager
 
-from mlflow_langchain_enrichment.auto import reset_current_trace_context, using_trace_context
+from mlflow_langchain_enrichment.auto import (
+    RootTraceHandle,
+    disable_mlflow_langchain_enrichment,
+    reset_current_trace_context,
+    set_current_trace_context,
+    using_trace_context,
+)
+from mlflow_langchain_enrichment.enrichment import (
+    TraceEnrichmentCallback,
+    build_invoke_config,
+    default_request_preview,
+    default_response_preview,
+)
 
 
 class _FakeMlflow:

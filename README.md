@@ -1,24 +1,46 @@
 # mlflow-langchain-enrichment
 
-Small Python package for enriching `mlflow.langchain.autolog()` traces with better trace list display and searchable trace context.
+Production-oriented helpers for enriching `mlflow.langchain.autolog()` traces with better trace list fields, request-scoped context, and async-friendly root tracing.
 
-## Why this exists
-
-The Databricks trace UI can show:
-
-- `Request` and `Response` previews
-- `Session` and `User`
-- custom `Tags` as columns
-- trace `metadata` that you can filter on
-
-The missing piece with LangChain autolog is that you still need to call `mlflow.update_current_trace(...)` while the autologged trace is active. This package does that by attaching a small LangChain callback handler to the same invocation that autolog instruments.
+This package is meant for teams already using LangChain plus MLflow tracing who want the trace UI to show useful business context such as `session_id`, `user_id`, custom tags, and request/response previews without forcing every developer to hand-write `mlflow.update_current_trace(...)`.
 
 Relevant docs:
 
 - Databricks trace enrichment: <https://docs.databricks.com/aws/en/mlflow3/genai/tracing/attach-tags/>
 - Databricks trace UI: <https://docs.databricks.com/aws/en/mlflow3/genai/tracing/observe-with-traces/ui-traces>
+- MLflow LangChain autologging: <https://mlflow.org/docs/latest/api_reference/python_api/mlflow.langchain.html>
 - MLflow `update_current_trace`: <https://mlflow.org/docs/latest/api_reference/python_api/mlflow.html#mlflow.update_current_trace>
-- MLflow `mlflow.langchain.autolog()` compatibility: <https://mlflow.org/docs/latest/api_reference/python_api/mlflow.langchain.html>
+
+## What this package adds
+
+- Request-scoped `TraceContext` with `session_id`, `user_id`, tags, metadata, and preview builders
+- Auto-injection of a LangChain callback so existing `invoke(...)` and `ainvoke(...)` paths can be enriched with minimal call-site change
+- Explicit open/close APIs for teams that do not want `with` blocks
+- Root-trace helpers for async frameworks when concurrent `ainvoke(...)` enrichment needs tighter control
+- Local examples for Ollama, tool calling, verification, and load testing
+
+## When to use which pattern
+
+### Sync apps
+
+Usually enough:
+
+```python
+mlflow.langchain.autolog()
+enable_mlflow_langchain_enrichment()
+```
+
+Then attach request context with `using_trace_context(...)` or `open_trace_context(...)`.
+
+### Async apps
+
+`mlflow.langchain.autolog()` supports `ainvoke(...)`, but for concurrent async workloads where `session_id` and other enriched fields must land reliably on the root trace, the safer pattern is:
+
+- keep `mlflow.langchain.autolog()` enabled for token usage and child spans
+- wrap each request with `using_root_trace(...)` or `open_root_trace(...)`
+- call unchanged `await chain.ainvoke(...)` inside that scope
+
+This is the recommended pattern for FastAPI-style async handlers.
 
 ## Install
 
@@ -26,65 +48,77 @@ Relevant docs:
 pip install -e .
 ```
 
-If `mlflow.langchain.autolog()` raises `ModuleNotFoundError: No module named 'langchain'`, install the top-level `langchain` package, not just `langchain-core`:
+If `mlflow.langchain.autolog()` fails with `ModuleNotFoundError: No module named 'langchain'`, install the top-level `langchain` package, not only `langchain-core`:
 
 ```bash
 pip install "langchain>=0.3.19,<1.3.0"
 ```
 
-This repo now declares that dependency in `pyproject.toml`.
+## Local setup
 
-Local example prerequisites:
+Start Ollama and a local MLflow server:
 
 ```bash
 ollama pull nemotron-3-nano
 ./scripts/start_mlflow_server.sh
 ```
 
-Script options:
+Optional server overrides:
 
 ```bash
 MLFLOW_PORT=5001 ./scripts/start_mlflow_server.sh
 MLFLOW_WORK_DIR=/tmp/mlflow-demo ./scripts/start_mlflow_server.sh
 ```
 
-## Package API
+## Public API
 
 ```python
-from mlflow_langchain_enrichment import TraceContext, invoke_with_enrichment
+from mlflow_langchain_enrichment import (
+    TraceContext,
+    invoke_with_enrichment,
+    ainvoke_with_enrichment,
+    enable_mlflow_langchain_enrichment,
+    get_current_trace_context,
+    using_trace_context,
+    open_trace_context,
+    close_trace_context,
+    using_root_trace,
+    open_root_trace,
+    close_root_trace,
+)
 ```
 
 `TraceContext` supports:
 
-- `tags`: mutable trace tags for UI columns and filtering
-- `metadata`: immutable trace metadata
+- `tags`: trace tags for UI columns and filtering
+- `metadata`: trace metadata for search and enrichment
+- `span_metadata`: extra LangChain runnable metadata
 - `user_id`: mapped to `metadata["mlflow.trace.user"]`
 - `session_id`: mapped to `metadata["mlflow.trace.session"]`
-- `client_request_id`: external request correlation id
-- `request_preview`: explicit `Request` column text
-- `response_preview`: explicit `Response` column text
+- `client_request_id`: external correlation id
+- `request_preview` / `response_preview`: explicit trace list text
 - `request_preview_builder` / `response_preview_builder`: custom preview logic
-- `span_metadata`: extra LangChain `RunnableConfig.metadata`
-- `trace_name`: sets LangChain `run_name` when one is not already provided
-- `mlflow_run_name`: optional associated MLflow Run name for the UI `Run name` column
+- `trace_name`: span or LangChain run name
+- `mlflow_run_name`: optional associated MLflow Run name
 - `run_tags`: optional tags for the associated MLflow Run
 - `run_description`: optional description for the associated MLflow Run
-- `ensure_run`: start an MLflow Run at the request boundary if none is active
+- `ensure_run`: open an MLflow Run if none is active
+- `capture_root_span_io`: control whether `using_root_trace(...)` writes root span `Inputs` / `Outputs`
 
 ## Minimum-change integration
 
-If your app already calls `chain.invoke(...)` or `await chain.ainvoke(...)` directly, you do not need to replace those call sites.
-
-Use the global hook once at startup:
+Enable autologging once at startup:
 
 ```python
+import mlflow
+
 from mlflow_langchain_enrichment import enable_mlflow_langchain_enrichment
 
 mlflow.langchain.autolog()
 enable_mlflow_langchain_enrichment()
 ```
 
-Then set request-scoped trace context around the existing application flow:
+Then set request context around your existing application flow:
 
 ```python
 from mlflow_langchain_enrichment import using_trace_context
@@ -98,9 +132,9 @@ with using_trace_context(
     result = chain.invoke(payload)
 ```
 
-The `invoke(...)` call is unchanged. The enrichment callback is injected through LangChain's callback manager automatically.
+The `chain.invoke(payload)` call stays unchanged.
 
-If your team prefers explicit open/close calls instead of a `with` block, use:
+If your team prefers explicit lifecycle control:
 
 ```python
 from mlflow_langchain_enrichment import close_trace_context, open_trace_context
@@ -118,58 +152,11 @@ finally:
     close_trace_context(handle)
 ```
 
-That has the same behavior as `using_trace_context(...)`: it sets the request-scoped trace context and closes any MLflow Run that it opened.
-
-A runnable verification script for this explicit style is in [verify_open_close_trace_context.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/verify_open_close_trace_context.py).
-
-For async load testing with unchanged `ainvoke(...)` calls, see [async_load_test_trace_context.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/async_load_test_trace_context.py). It sends 10 concurrent requests grouped across `session-1` (`3` requests), `session-2` (`3` requests), and `session-3` (`4` requests) so you can verify session isolation in the trace UI.
-
-If async task-local tracing is still inconsistent in your environment, use [threaded_load_test_trace_context.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/threaded_load_test_trace_context.py) instead. It runs the same `10` requests with the same `3/3/4` session split using threads, which is typically more reliable for MLflow autolog trace isolation than concurrent `ainvoke(...)` tasks.
-
-To test whether newer MLflow async tracing fixes are sufficient in your environment, see [async_manual_root_trace_load_test.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/async_manual_root_trace_load_test.py). That example creates one root trace per async request, sets `mlflow.trace.session` directly on the root trace, and then calls `await chain.ainvoke(...)` under concurrent load.
-
-For FastAPI-style async handlers, you can simplify that pattern with the new manual-root-trace helpers:
+If you already have request context in framework state, register a provider once:
 
 ```python
-from mlflow_langchain_enrichment import using_root_trace
+from mlflow_langchain_enrichment import TraceContext, enable_mlflow_langchain_enrichment
 
-async def traced_request(chain, payload, session_id, user_id, request_id):
-    with using_root_trace(
-        user_id=user_id,
-        session_id=session_id,
-        client_request_id=request_id,
-        trace_name=f"chat-{session_id}",
-    ) as trace:
-        trace.request = payload
-        result = await chain.ainvoke(payload)
-        trace.response = result
-        return result
-```
-
-By default, this writes request/response previews to the trace UI but does not duplicate full inputs/outputs onto the manual root span. If you explicitly want root-span inputs/outputs too, pass `capture_root_span_io=True`.
-By default, this writes request/response previews to the trace UI and also sets normalized `Inputs` / `Outputs` on the manual root span so the request span in UI is complete. If you want the root span to stay as a pure envelope, pass `capture_root_span_io=False`.
-
-If your team prefers explicit lifecycle control instead of a `with` block, the package also exports `open_root_trace(...)` and `close_root_trace(...)`.
-
-If the UI `Run name` column is empty, that means the trace is not associated with an MLflow Run. In MLflow, that column comes from the active `mlflow.start_run(...)` context, not from the trace name. To populate it with minimum change, let `using_trace_context(...)` open a run for the request:
-
-```python
-with using_trace_context(
-    user_id=user_id,
-    session_id=session_id,
-    mlflow_run_name=f"chat-{session_id}",
-    ensure_run=True,
-    tags={"app": "support-bot", "route": route_name},
-):
-    result = chain.invoke(payload)
-```
-
-If there is already an active MLflow Run, `using_trace_context(...)` leaves it alone.
-
-If you already have request context stored elsewhere, you can avoid even the `with` block and register a provider:
-
-```python
-from mlflow_langchain_enrichment import enable_mlflow_langchain_enrichment, TraceContext
 
 def current_trace_context() -> TraceContext:
     return TraceContext(
@@ -179,12 +166,64 @@ def current_trace_context() -> TraceContext:
         metadata={"deployment": "prod"},
     )
 
+
 enable_mlflow_langchain_enrichment(current_trace_context)
 ```
 
 After that, existing `invoke(...)` and `ainvoke(...)` paths pick up enrichment automatically whenever the provider returns a context.
 
-## Local MLflow + Ollama example
+## Async production pattern
+
+For concurrent async handlers, use a root trace per request and keep autologging enabled:
+
+```python
+import mlflow
+
+from mlflow_langchain_enrichment import using_root_trace
+
+mlflow.langchain.autolog()
+
+
+async def traced_request(chain, payload, session_id, user_id, request_id):
+    with using_root_trace(
+        user_id=user_id,
+        session_id=session_id,
+        client_request_id=request_id,
+        trace_name=f"chat-{session_id}",
+        capture_root_span_io=False,
+    ) as trace:
+        trace.request = payload
+        result = await chain.ainvoke(payload)
+        trace.response = result
+        return result
+```
+
+Why this is the recommended async shape:
+
+- root trace gets `session_id`, `user_id`, request/response previews, and request correlation
+- LangChain autologging still emits child spans such as `ChatOllama` and tool spans
+- token usage remains available through the autologged model span
+- `capture_root_span_io=False` keeps the root span as an envelope and avoids duplicating the child model span inputs/outputs
+
+If your team prefers explicit lifecycle control instead of a `with` block, use `open_root_trace(...)` and `close_root_trace(...)`.
+
+## Async limitations and references
+
+MLflow documents async LangChain autologging as supported for `ainvoke`, `abatch`, and `astream`, but it also explicitly warns that the logging work itself is not asynchronous and may block the main thread. That means async tracing can still add latency under load even when the model call is awaited normally.
+
+For concurrent async applications, MLflow also documents `mlflow.tracing.set_destination(..., context_local=True)` as the mechanism for task-local destination isolation. That helps with routing traces per task or thread, but it does not by itself guarantee that every autologged async trace-enrichment pattern will behave correctly in all combinations.
+
+This package recommends `using_root_trace(...)` for production async request handlers because it gives you explicit request-level control over session/user enrichment while still keeping `mlflow.langchain.autolog()` enabled for child spans and token usage.
+
+References:
+
+- MLflow LangChain autologging async warning: <https://mlflow.org/docs/latest/genai/flavors/langchain/autologging/>
+- MLflow LangChain API reference, including `run_tracer_inline`: <https://mlflow.org/docs/latest/api_reference/python_api/mlflow.langchain.html>
+- MLflow tracing FAQ on `context_local=True`: <https://www.mlflow.org/docs/3.3.0/genai/tracing/faq/>
+- MLflow issue `#16880` on async manual-trace + autolog hierarchy problems: <https://github.com/mlflow/mlflow/issues/16880>
+- MLflow issue `#18216` on separate traces when combining manual and automatic tracing: <https://github.com/mlflow/mlflow/issues/18216>
+
+## Simple local example
 
 ```python
 import mlflow
@@ -211,15 +250,8 @@ trace_context = TraceContext(
     user_id="user-42",
     session_id="session-20260306-001",
     client_request_id="req-20260306-abc",
-    tags={
-        "app": "support-bot",
-        "environment": "dev",
-        "feature": "billing-help",
-    },
-    metadata={
-        "app_version": "0.1.0",
-        "deployment": "local-mlflow-server",
-    },
+    tags={"app": "support-bot", "environment": "dev", "feature": "billing-help"},
+    metadata={"app_version": "0.1.0", "deployment": "local-mlflow-server"},
     span_metadata={"tenant": "local-demo", "provider": "ollama"},
 )
 
@@ -227,86 +259,42 @@ result = invoke_with_enrichment(
     chain,
     {"question": "Why was invoice INV-42 charged twice?"},
     trace_context,
-    config={"metadata": {"route": "billing"}},
 )
 
 print(result.content)
 ```
 
-The full runnable script is in [examples/local_ollama_mlflow.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/local_ollama_mlflow.py).
+## Tool-calling example
 
-An auto-integration example that keeps `chain.invoke(...)` unchanged is in [examples/local_ollama_auto_enrichment_mlflow.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/local_ollama_auto_enrichment_mlflow.py).
+`langchain 1.x` tool-calling with `ChatOllama` is in [examples/local_ollama_tool_calling_mlflow.py](examples/local_ollama_tool_calling_mlflow.py). In the trace UI you should see nested spans for:
 
-## Tool-calling trace example
+- root request trace
+- agent execution
+- chat model call
+- each tool invocation
 
-```python
-import mlflow
-from langchain.agents import create_agent
-from langchain_core.tools import tool
-from langchain_ollama import ChatOllama
+## Verification and load-test examples
 
-from mlflow_langchain_enrichment import TraceContext, invoke_with_enrichment
+- [examples/local_ollama_mlflow.py](examples/local_ollama_mlflow.py): basic sync enrichment example
+- [examples/local_ollama_auto_enrichment_mlflow.py](examples/local_ollama_auto_enrichment_mlflow.py): unchanged `chain.invoke(...)` with automatic context injection
+- [examples/local_ollama_tool_calling_mlflow.py](examples/local_ollama_tool_calling_mlflow.py): tool-calling trace example
+- [examples/verify_open_close_trace_context.py](examples/verify_open_close_trace_context.py): verify explicit trace-context lifecycle
+- [examples/async_load_test_trace_context.py](examples/async_load_test_trace_context.py): concurrent async autolog enrichment test
+- [examples/threaded_load_test_trace_context.py](examples/threaded_load_test_trace_context.py): threaded fallback when async autolog context is unreliable
+- [examples/async_manual_root_trace_load_test.py](examples/async_manual_root_trace_load_test.py): concurrent async root-trace verification
 
+## What appears in the UI
 
-@tool
-def lookup_account_tier(account_id: str) -> str:
-    """Look up the support tier for an account."""
-    tiers = {"ACME-42": "enterprise", "STARTUP-7": "pro"}
-    return tiers.get(account_id, "standard")
+This package enriches the trace UI as follows:
 
+- `Request`: generated from LangChain input or overridden with `request_preview`
+- `Response`: generated from chain output or overridden with `response_preview`
+- `Session`: from `metadata["mlflow.trace.session"]`
+- `User`: from `metadata["mlflow.trace.user"]`
+- custom tag columns such as `app`, `environment`, `feature`
+- searchable metadata such as `app_version`, `deployment`, or custom business attributes
 
-@tool
-def lookup_ticket_status(ticket_id: str) -> str:
-    """Look up the current status of a support ticket."""
-    statuses = {"TICK-1001": "Open and assigned to billing."}
-    return statuses.get(ticket_id, "Ticket not found.")
-
-
-agent = create_agent(
-    model=ChatOllama(model="nemotron-3-nano", temperature=0),
-    tools=[lookup_account_tier, lookup_ticket_status],
-    system_prompt="Use tools for account and ticket questions.",
-)
-
-mlflow.set_tracking_uri("http://127.0.0.1:5000")
-mlflow.set_experiment("langchain-trace-enrichment")
-mlflow.langchain.autolog()
-
-result = invoke_with_enrichment(
-    agent,
-    {
-        "messages": [
-            {
-                "role": "user",
-                "content": "What tier is account ACME-42 on and what is ticket TICK-1001 status?",
-            }
-        ]
-    },
-    TraceContext(tags={"feature": "tool-calling"}),
-)
-
-print(result["messages"][-1].content)
-```
-
-The full runnable script is in [examples/local_ollama_tool_calling_mlflow.py](/Users/binzhang/vibe_coding_repo/mlflow-features/examples/local_ollama_tool_calling_mlflow.py).
-
-This example targets `langchain 1.x`, which uses `create_agent(...)` instead of the older `AgentExecutor` / `create_tool_calling_agent(...)` API.
-
-In the trace UI you should see nested spans for the agent execution, the chat model call, and each tool invocation. This is an inference from the official MLflow LangChain autolog docs plus the LangChain 1.x agent flow:
-
-- MLflow autolog traces nested LangChain callbacks: <https://mlflow.org/docs/latest/genai/tracing/integrations/listing/langchain/>
-- LangChain agent API: <https://docs.langchain.com/oss/python/langchain/agents>
-
-## What shows up in the MLflow / Databricks UI
-
-- `Request`: built from the LangChain input, or overridden with `request_preview`
-- `Response`: built from the final chain output, or overridden with `response_preview`
-- `Session`: populated from `metadata["mlflow.trace.session"]`
-- `User`: populated from `metadata["mlflow.trace.user"]`
-- tag columns such as `app`, `environment`, `feature`
-- metadata filters such as `metadata.app_version = '0.1.0'`
-
-In the Traces tab, use `Columns` to add tag columns and use queries like:
+Typical queries:
 
 ```text
 metadata.`mlflow.trace.user` = 'user-42'
@@ -315,11 +303,11 @@ metadata.app_version = '0.1.0'
 tags.environment = 'dev'
 ```
 
+If the UI `Run name` column is empty, the trace is not associated with an active MLflow Run. Use `ensure_run=True` or wrap the request in your own `mlflow.start_run(...)` context.
+
 ## Files
 
 - package code: `src/mlflow_langchain_enrichment/`
-- example: `examples/local_ollama_mlflow.py`
-- auto example: `examples/local_ollama_auto_enrichment_mlflow.py`
-- tool-calling example: `examples/local_ollama_tool_calling_mlflow.py`
-- mlflow server script: `scripts/start_mlflow_server.sh`
+- examples: `examples/`
+- server script: `scripts/start_mlflow_server.sh`
 - tests: `tests/test_enrichment.py`
