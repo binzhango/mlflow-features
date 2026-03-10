@@ -4,6 +4,7 @@ import asyncio
 import sys
 import unittest
 
+from deepagents.graph import resolve_model
 from mlflow_langchain_enrichment import (
     TraceContext,
     TraceSession,
@@ -20,6 +21,9 @@ from mlflow_langchain_enrichment import (
     using_root_trace,
 )
 from langchain_core.callbacks.manager import CallbackManager
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
 from mlflow_langchain_enrichment.auto import (
     RootTraceHandle,
@@ -72,6 +76,7 @@ class _FakeMlflow:
             def __enter__(self_inner):
                 self_inner.inputs = None
                 self_inner.outputs = None
+                self_inner.attributes = {}
                 fake_mlflow.started_spans[-1]["context"] = self_inner
                 return self_inner
 
@@ -83,6 +88,12 @@ class _FakeMlflow:
 
             def set_outputs(self_inner, outputs):
                 self_inner.outputs = outputs
+
+            def set_attribute(self_inner, key, value):
+                self_inner.attributes[key] = value
+
+            def set_attributes(self_inner, attributes):
+                self_inner.attributes.update(attributes)
 
         return _SpanContext()
 
@@ -121,6 +132,29 @@ class _ErrorRunnable(_FakeRunnable):
     def invoke(self, inputs, config=None, **kwargs):
         self.last_config = config
         raise ValueError("boom")
+
+
+class _FakeChatModel(BaseChatModel):
+    model_name: str = "fake-chat"
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="chat-ok",
+                        response_metadata={"model": self.model_name},
+                    )
+                )
+            ]
+        )
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return _FakeRunnable(AIMessage(content="tool-ok"))
 
 
 class ErgonomicApiTests(unittest.TestCase):
@@ -172,6 +206,67 @@ class ErgonomicApiTests(unittest.TestCase):
         self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["app_version"], "0.1.0")
         self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["model_name"], "fake-llm")
         self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["response_type"], "dict")
+
+    def test_auto_trace_llm_preserves_base_chat_model_identity(self) -> None:
+        traced_llm = auto_trace_llm(
+            _FakeChatModel(),
+            session_id="session-chat",
+            trace_name="chat-trace",
+        )
+
+        self.assertIsInstance(traced_llm, BaseChatModel)
+        self.assertIs(resolve_model(traced_llm), traced_llm)
+
+        result = traced_llm.invoke("hello")
+
+        self.assertEqual(result.content, "chat-ok")
+        self.assertEqual(self.fake_mlflow.started_spans[0]["name"], "chat-trace")
+        self.assertEqual(
+            self.fake_mlflow.calls[-1]["metadata"]["mlflow.trace.session"],
+            "session-chat",
+        )
+
+    def test_auto_trace_llm_preserves_chat_model_identity_for_bound_llm(self) -> None:
+        traced_llm = auto_trace_llm(
+            _FakeChatModel().with_config({"run_name": "bound-chat"}),
+            session_id="session-bound-chat",
+            trace_name="bound-chat-trace",
+        )
+
+        self.assertIsInstance(traced_llm, BaseChatModel)
+        self.assertIs(resolve_model(traced_llm), traced_llm)
+
+    def test_auto_trace_llm_sets_reserved_mlflow_token_usage_fields(self) -> None:
+        traced_llm = auto_trace_llm(
+            _FakeRunnable(
+                AIMessage(
+                    content="ok",
+                    usage_metadata={
+                        "input_tokens": 5,
+                        "output_tokens": 7,
+                        "total_tokens": 12,
+                    },
+                )
+            ),
+            session_id="session-token-usage",
+            trace_name="token-usage-trace",
+        )
+
+        result = asyncio.run(traced_llm.ainvoke({"question": "hello"}))
+
+        self.assertEqual(result.content, "ok")
+        self.assertEqual(
+            self.fake_mlflow.calls[-1]["metadata"]["mlflow.trace.tokenUsage"],
+            '{"input_tokens":5,"output_tokens":7,"total_tokens":12}',
+        )
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["input_tokens"], "5")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["output_tokens"], "7")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["total_tokens"], "12")
+        span = self.fake_mlflow.started_spans[-1]["context"]
+        self.assertEqual(
+            span.attributes["mlflow.chat.tokenUsage"],
+            {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
+        )
 
     def test_trace_llm_supports_async_context_manager(self) -> None:
         async def _run():

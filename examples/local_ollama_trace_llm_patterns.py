@@ -44,7 +44,7 @@ async def main() -> None:
 
     auto_llm = auto_trace_llm(
         llm,
-        # user_id="user-101",
+        user_id="user-101",
         session_id="session-20260310-auto-001",
         trace_name="auto-pattern",
         mlflow_run_name="auto-pattern-demo",

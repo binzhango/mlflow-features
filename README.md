@@ -14,6 +14,7 @@ Relevant docs:
 Project docs:
 
 - [docs/ui-attributes-guide.md](docs/ui-attributes-guide.md): how to add new tags, metadata, previews, and dynamic builders for future trace UI display
+- [docs/performance-tuning-guide.md](docs/performance-tuning-guide.md): how to reason about MLflow tracing overhead and tune async/root-trace performance
 
 ## What this package adds
 
@@ -353,6 +354,9 @@ print(result.content)
 - [examples/local_ollama_auto_enrichment_mlflow.py](examples/local_ollama_auto_enrichment_mlflow.py): unchanged `chain.invoke(...)` with automatic context injection
 - [examples/local_ollama_trace_llm_patterns.py](examples/local_ollama_trace_llm_patterns.py): `auto_trace_llm(...)`, `trace_llm(...)`, and `trace_llm_call(...)`
 - [examples/async_auto_trace_llm_load_test.py](examples/async_auto_trace_llm_load_test.py): 10 concurrent `auto_trace_llm(...)` requests with per-request trace attributes
+- [examples/async_auto_trace_llm_stream_test.py](examples/async_auto_trace_llm_stream_test.py): concurrent `auto_trace_llm(...).astream(...)` verification
+- [examples/local_ollama_deepagents_supervisor_mlflow.py](examples/local_ollama_deepagents_supervisor_mlflow.py): Deep Agents supervisor with 3 traced subagents sharing one `session_id`
+- [examples/local_ollama_supervisor_subagents_mlflow.py](examples/local_ollama_supervisor_subagents_mlflow.py): supervisor agent plus 3 traced subagents sharing one `session_id`
 - [examples/local_ollama_tool_calling_mlflow.py](examples/local_ollama_tool_calling_mlflow.py): tool-calling trace example
 - [examples/verify_open_close_trace_context.py](examples/verify_open_close_trace_context.py): verify explicit trace-context lifecycle
 - [examples/async_load_test_trace_context.py](examples/async_load_test_trace_context.py): concurrent async autolog enrichment test

@@ -1,4 +1,4 @@
-"""Verify 10 concurrent async requests using auto_trace_llm(...)."""
+"""Verify concurrent async streaming requests using auto_trace_llm(...)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ from langchain_ollama import ChatOllama
 from mlflow_langchain_enrichment import auto_trace_llm
 
 
+CONCURRENCY = 3
+SHARED_SESSION_ID = "session-auto-trace-stream-shared"
+
+
 def build_messages(question: str):
     return [
         SystemMessage(content="You are a concise support assistant."),
@@ -22,16 +26,16 @@ def build_messages(question: str):
 
 def build_base_llm():
     return ChatOllama(model="nemotron-3-nano", temperature=0).with_config(
-        {"run_name": "support-assistant-auto-trace-load"}
+        {"run_name": "support-assistant-auto-trace-stream"}
     )
 
 
-async def run_request(
+async def run_stream_request(
     *,
     request_id: int,
-    session_id: str,
     experiment_id: str,
     started_at: float,
+    print_lock: asyncio.Lock,
 ) -> dict[str, str]:
     mlflow.tracing.set_destination(
         MlflowExperimentLocation(experiment_id=experiment_id),
@@ -42,16 +46,14 @@ async def run_request(
     traced_llm = auto_trace_llm(
         base_llm,
         user_id=f"user-{request_id:02d}",
-        session_id=session_id,
-        client_request_id=f"req-20260310-auto-load-{request_id:02d}",
-        mlflow_run_name=f"auto-trace-load-{session_id}-{request_id:02d}",
+        session_id=SHARED_SESSION_ID,
+        client_request_id=f"req-20260310-auto-stream-{request_id:02d}",
+        mlflow_run_name=f"auto-trace-stream-{request_id:02d}",
         ensure_run=False,
-        capture_root_span_io=False,
         tags={
             "app": "support-bot",
             "environment": "dev",
-            "feature": "async-auto-trace-load",
-            "session_group": session_id,
+            "feature": "async-auto-trace-stream",
             "model": getattr(base_llm, "model", "unknown"),
         },
         metadata={
@@ -60,7 +62,7 @@ async def run_request(
             "request_number": str(request_id),
             "model_name": getattr(base_llm, "model", "unknown"),
         },
-        trace_name=f"auto-trace-load-{session_id}",
+        trace_name=f"auto-trace-stream-{request_id:02d}",
         metadata_builder=lambda runnable, inputs, response, error: {
             "response_chars": str(len(getattr(response, "content", "") or "")),
         },
@@ -68,25 +70,39 @@ async def run_request(
 
     messages = build_messages(
         (
-            f"Request {request_id:02d}: summarize why invoice INV-{request_id:02d} "
-            f"might be double charged for session {session_id}."
+            f"Request {request_id:02d}: stream a one-sentence explanation for why invoice "
+            f"INV-{request_id:02d} might be double charged."
         )
     )
 
-    print(
-        f"{time.perf_counter() - started_at:6.2f}s "
-        f"start request={request_id:02d} session={session_id}"
-    )
-    result = await traced_llm.ainvoke(messages)
-    print(
-        f"{time.perf_counter() - started_at:6.2f}s "
-        f"done  request={request_id:02d} session={session_id}"
-    )
+    async with print_lock:
+        print(
+            f"{time.perf_counter() - started_at:6.2f}s "
+            f"start stream request={request_id:02d}"
+        )
+
+    chunks: list[str] = []
+    async for chunk in traced_llm.astream(messages):
+        text = getattr(chunk, "content", "")
+        if text:
+            chunks.append(text)
+            async with print_lock:
+                print(
+                    f"{time.perf_counter() - started_at:6.2f}s "
+                    f"chunk request={request_id:02d} text={text!r}"
+                )
+
+    final_response = "".join(chunks)
+    async with print_lock:
+        print(
+            f"{time.perf_counter() - started_at:6.2f}s "
+            f"done  stream request={request_id:02d}"
+        )
 
     return {
         "request_id": f"{request_id:02d}",
-        "session_id": session_id,
-        "response": result.content,
+        "session_id": SHARED_SESSION_ID,
+        "response": final_response,
     }
 
 
@@ -95,19 +111,19 @@ async def main() -> None:
     experiment = mlflow.set_experiment("langchain-trace-enrichment")
     mlflow.langchain.autolog()
 
-    session_id = "session-auto-trace-load-shared"
     started_at = time.perf_counter()
+    print_lock = asyncio.Lock()
 
     tasks = [
         asyncio.create_task(
-            run_request(
+            run_stream_request(
                 request_id=index + 1,
-                session_id=session_id,
                 experiment_id=experiment.experiment_id,
                 started_at=started_at,
+                print_lock=print_lock,
             )
         )
-        for index in range(10)
+        for index in range(CONCURRENCY)
     ]
     results = await asyncio.gather(*tasks)
 
