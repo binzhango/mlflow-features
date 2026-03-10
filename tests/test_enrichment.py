@@ -9,6 +9,7 @@ from mlflow_langchain_enrichment import (
     TraceContext,
     TraceSession,
     auto_trace_llm,
+    auto_trace_chain,
     close_root_trace,
     close_trace_context,
     enable_mlflow_langchain_enrichment,
@@ -266,6 +267,52 @@ class ErgonomicApiTests(unittest.TestCase):
         self.assertEqual(
             span.attributes["mlflow.chat.tokenUsage"],
             {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
+        )
+
+    def test_auto_trace_chain_wraps_raw_ainvoke(self) -> None:
+        traced_chain = auto_trace_chain(
+            _FakeRunnable({"answer": "ok"}),
+            user_id="user-chain",
+            session_id="session-chain",
+            trace_name="auto-chain",
+        )
+
+        result = asyncio.run(traced_chain.ainvoke({"question": "hello"}))
+
+        self.assertEqual(result, {"answer": "ok"})
+        self.assertEqual(self.fake_mlflow.started_spans[0]["name"], "auto-chain")
+        self.assertEqual(
+            self.fake_mlflow.calls[-1]["metadata"]["mlflow.trace.session"],
+            "session-chain",
+        )
+
+    def test_auto_trace_chain_sets_reserved_mlflow_token_usage_fields(self) -> None:
+        traced_chain = auto_trace_chain(
+            _FakeRunnable(
+                {
+                    "answer": "ok",
+                    "usage_metadata": {
+                        "input_tokens": 3,
+                        "output_tokens": 4,
+                        "total_tokens": 7,
+                    },
+                }
+            ),
+            session_id="session-chain-token-usage",
+            trace_name="chain-token-usage",
+        )
+
+        result = asyncio.run(traced_chain.ainvoke({"question": "hello"}))
+
+        self.assertEqual(result["answer"], "ok")
+        self.assertEqual(
+            self.fake_mlflow.calls[-1]["metadata"]["mlflow.trace.tokenUsage"],
+            '{"input_tokens":3,"output_tokens":4,"total_tokens":7}',
+        )
+        span = self.fake_mlflow.started_spans[-1]["context"]
+        self.assertEqual(
+            span.attributes["mlflow.chat.tokenUsage"],
+            {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
         )
 
     def test_trace_llm_supports_async_context_manager(self) -> None:

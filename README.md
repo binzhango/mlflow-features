@@ -363,6 +363,12 @@ print(result.content)
 - [examples/threaded_load_test_trace_context.py](examples/threaded_load_test_trace_context.py): threaded fallback when async autolog context is unreliable
 - [examples/async_manual_root_trace_load_test.py](examples/async_manual_root_trace_load_test.py): concurrent async root-trace verification
 
+## Guides
+
+- [docs/auto-trace-llm-guide.md](docs/auto-trace-llm-guide.md): focused guide for `auto_trace_llm(...)`
+- [docs/ui-attributes-guide.md](docs/ui-attributes-guide.md): how to add tags, metadata, and previews for UI display
+- [docs/performance-tuning-guide.md](docs/performance-tuning-guide.md): async tracing tradeoffs and tuning ideas
+
 ## What appears in the UI
 
 This package enriches the trace UI as follows:
