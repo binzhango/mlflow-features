@@ -366,6 +366,7 @@ print(result.content)
 ## Guides
 
 - [docs/auto-trace-llm-guide.md](docs/auto-trace-llm-guide.md): focused guide for `auto_trace_llm(...)`
+- [docs/developer-trace-attributes-guide.md](docs/developer-trace-attributes-guide.md): how to add dynamic metadata, tags, and reserved MLflow fields safely
 - [docs/ui-attributes-guide.md](docs/ui-attributes-guide.md): how to add tags, metadata, and previews for UI display
 - [docs/performance-tuning-guide.md](docs/performance-tuning-guide.md): async tracing tradeoffs and tuning ideas
 
