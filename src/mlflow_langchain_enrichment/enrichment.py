@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - keeps importable in bare environments
 
 
 PreviewBuilder = Callable[[Any], str | None]
+TraceAttributeBuilder = Callable[[Any, Any, Any, BaseException | None], Mapping[str, Any] | None]
 DEFAULT_PREVIEW_LENGTH = 160
 
 
@@ -208,6 +209,8 @@ class TraceContext:
     response_preview: str | None = None
     request_preview_builder: PreviewBuilder | None = None
     response_preview_builder: PreviewBuilder | None = None
+    tags_builder: TraceAttributeBuilder | None = None
+    metadata_builder: TraceAttributeBuilder | None = None
     preview_limit: int = DEFAULT_PREVIEW_LENGTH
     trace_name: str | None = None
     capture_root_span_io: bool = True
@@ -345,16 +348,19 @@ class TraceEnrichmentCallback(BaseCallbackHandler):
         self._finish_root(run_id, response=f"{type(error).__name__}: {error}", state="ERROR")
 
 
-def build_invoke_config(
+def build_runnable_config(
     trace_context: TraceContext,
     config: Mapping[str, Any] | None = None,
+    *,
+    include_callback: bool = True,
 ) -> dict[str, Any]:
     built = dict(config or {})
 
-    callbacks = list(built.get("callbacks", []))
-    if not any(isinstance(callback, TraceEnrichmentCallback) for callback in callbacks):
-        callbacks.append(TraceEnrichmentCallback(trace_context))
-    built["callbacks"] = callbacks
+    if include_callback:
+        callbacks = list(built.get("callbacks", []))
+        if not any(isinstance(callback, TraceEnrichmentCallback) for callback in callbacks):
+            callbacks.append(TraceEnrichmentCallback(trace_context))
+        built["callbacks"] = callbacks
 
     metadata = dict(built.get("metadata", {}))
     metadata.update(trace_context.runnable_metadata())
@@ -365,6 +371,13 @@ def build_invoke_config(
         built["run_name"] = trace_context.trace_name
 
     return built
+
+
+def build_invoke_config(
+    trace_context: TraceContext,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return build_runnable_config(trace_context, config, include_callback=True)
 
 
 def invoke_with_enrichment(

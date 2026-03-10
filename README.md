@@ -11,6 +11,10 @@ Relevant docs:
 - MLflow LangChain autologging: <https://mlflow.org/docs/latest/api_reference/python_api/mlflow.langchain.html>
 - MLflow `update_current_trace`: <https://mlflow.org/docs/latest/api_reference/python_api/mlflow.html#mlflow.update_current_trace>
 
+Project docs:
+
+- [docs/ui-attributes-guide.md](docs/ui-attributes-guide.md): how to add new tags, metadata, previews, and dynamic builders for future trace UI display
+
 ## What this package adds
 
 - Request-scoped `TraceContext` with `session_id`, `user_id`, tags, metadata, and preview builders
@@ -77,8 +81,13 @@ from mlflow_langchain_enrichment import (
     TraceContext,
     invoke_with_enrichment,
     ainvoke_with_enrichment,
+    auto_trace_llm,
+    auto_trace_chain,
+    auto_trace_runnable,
     enable_mlflow_langchain_enrichment,
     get_current_trace_context,
+    trace_llm,
+    trace_llm_call,
     using_trace_context,
     open_trace_context,
     close_trace_context,
@@ -98,6 +107,7 @@ from mlflow_langchain_enrichment import (
 - `client_request_id`: external correlation id
 - `request_preview` / `response_preview`: explicit trace list text
 - `request_preview_builder` / `response_preview_builder`: custom preview logic
+- `tags_builder` / `metadata_builder`: derive final trace fields from `(runnable, inputs, response, error)`
 - `trace_name`: span or LangChain run name
 - `mlflow_run_name`: optional associated MLflow Run name
 - `run_tags`: optional tags for the associated MLflow Run
@@ -207,6 +217,70 @@ Why this is the recommended async shape:
 
 If your team prefers explicit lifecycle control instead of a `with` block, use `open_root_trace(...)` and `close_root_trace(...)`.
 
+## Ergonomic APIs
+
+For simpler call sites, there are three higher-level entrypoints.
+
+### 1. Auto-wrapped LLM
+
+```python
+from mlflow_langchain_enrichment import auto_trace_llm
+
+llm = ChatOllama(model="nemotron-3-nano", temperature=0)
+llm = auto_trace_llm(
+    llm,
+    user_id=user_id,
+    session_id=session_id,
+    trace_name="billing-chat",
+    ensure_run=True,
+    tags={"app": "support-bot", "model": llm.model},
+    metadata={"app_version": "0.1.0", "model_name": llm.model},
+    tags_builder=lambda runnable, inputs, response, error: {
+        "response_kind": "tool" if getattr(response, "tool_calls", None) else "chat",
+    },
+    metadata_builder=lambda runnable, inputs, response, error: {
+        "response_chars": len(getattr(response, "content", "") or ""),
+    },
+)
+
+response = await llm.ainvoke(messages)
+```
+
+### 2. Context manager
+
+```python
+from mlflow_langchain_enrichment import trace_llm
+
+async with trace_llm(
+    user_id=user_id,
+    session_id=session_id,
+    trace_name="billing-chat",
+) as trace:
+    trace.set_request(messages)
+    response = await llm.ainvoke(messages)
+    trace.add_tags({"model": llm.model})
+    trace.add_metadata({"model_name": llm.model})
+    trace.set_response(response)
+```
+
+### 3. Decorator
+
+```python
+from mlflow_langchain_enrichment import trace_llm_call
+
+@trace_llm_call(
+    user_id=user_id,
+    session_id=session_id,
+    trace_name="billing-chat",
+)
+async def agent(llm, input):
+    return await llm.ainvoke(input)
+```
+
+The decorator auto-detects a likely request argument for common signatures such as `func(llm, input)` or `func(input=...)`. If your function shape is different, pass `request_resolver=...`.
+
+If you need to inspect the response first and then attach new UI fields, prefer `trace_llm(...)` over `auto_trace_llm(...)`. `TraceSession` supports `add_tags(...)`, `add_metadata(...)`, and `update_trace(...)` before the trace closes.
+
 ## Async limitations and references
 
 MLflow documents async LangChain autologging as supported for `ainvoke`, `abatch`, and `astream`, but it also explicitly warns that the logging work itself is not asynchronous and may block the main thread. That means async tracing can still add latency under load even when the model call is awaited normally.
@@ -277,6 +351,8 @@ print(result.content)
 
 - [examples/local_ollama_mlflow.py](examples/local_ollama_mlflow.py): basic sync enrichment example
 - [examples/local_ollama_auto_enrichment_mlflow.py](examples/local_ollama_auto_enrichment_mlflow.py): unchanged `chain.invoke(...)` with automatic context injection
+- [examples/local_ollama_trace_llm_patterns.py](examples/local_ollama_trace_llm_patterns.py): `auto_trace_llm(...)`, `trace_llm(...)`, and `trace_llm_call(...)`
+- [examples/async_auto_trace_llm_load_test.py](examples/async_auto_trace_llm_load_test.py): 10 concurrent `auto_trace_llm(...)` requests with per-request trace attributes
 - [examples/local_ollama_tool_calling_mlflow.py](examples/local_ollama_tool_calling_mlflow.py): tool-calling trace example
 - [examples/verify_open_close_trace_context.py](examples/verify_open_close_trace_context.py): verify explicit trace-context lifecycle
 - [examples/async_load_test_trace_context.py](examples/async_load_test_trace_context.py): concurrent async autolog enrichment test

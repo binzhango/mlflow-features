@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import unittest
 
 from mlflow_langchain_enrichment import (
     TraceContext,
+    TraceSession,
+    auto_trace_llm,
     close_root_trace,
     close_trace_context,
     enable_mlflow_langchain_enrichment,
@@ -12,6 +15,8 @@ from mlflow_langchain_enrichment import (
     invoke_with_enrichment,
     open_root_trace,
     open_trace_context,
+    trace_llm,
+    trace_llm_call,
     using_root_trace,
 )
 from langchain_core.callbacks.manager import CallbackManager
@@ -86,10 +91,181 @@ class _FakeRunnable:
     def __init__(self, response):
         self.response = response
         self.last_config = None
+        self.last_kwargs = None
+        self.model = "fake-llm"
 
     def invoke(self, inputs, config=None, **kwargs):
         self.last_config = config
+        self.last_kwargs = kwargs
         return self.response
+
+    async def ainvoke(self, inputs, config=None, **kwargs):
+        self.last_config = config
+        self.last_kwargs = kwargs
+        return self.response
+
+    def stream(self, inputs, config=None, **kwargs):
+        self.last_config = config
+        self.last_kwargs = kwargs
+        for chunk in self.response:
+            yield chunk
+
+    async def astream(self, inputs, config=None, **kwargs):
+        self.last_config = config
+        self.last_kwargs = kwargs
+        for chunk in self.response:
+            yield chunk
+
+
+class _ErrorRunnable(_FakeRunnable):
+    def invoke(self, inputs, config=None, **kwargs):
+        self.last_config = config
+        raise ValueError("boom")
+
+
+class ErgonomicApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_mlflow = sys.modules.get("mlflow")
+        self.fake_mlflow = _FakeMlflow()
+        sys.modules["mlflow"] = self.fake_mlflow
+
+    def tearDown(self) -> None:
+        disable_mlflow_langchain_enrichment()
+        if self.original_mlflow is None:
+            sys.modules.pop("mlflow", None)
+        else:
+            sys.modules["mlflow"] = self.original_mlflow
+
+    def test_auto_trace_llm_wraps_raw_ainvoke(self) -> None:
+        traced_llm = auto_trace_llm(
+            _FakeRunnable({"answer": "ok"}),
+            user_id="user-30",
+            session_id="session-30",
+            trace_name="auto-llm",
+        )
+
+        result = asyncio.run(traced_llm.ainvoke({"question": "hello"}))
+
+        self.assertEqual(result, {"answer": "ok"})
+        self.assertEqual(self.fake_mlflow.started_spans[0]["name"], "auto-llm")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["mlflow.trace.user"], "user-30")
+
+    def test_auto_trace_llm_can_add_dynamic_tags_and_metadata_without_request_model(self) -> None:
+        traced_llm = auto_trace_llm(
+            _FakeRunnable({"content": "ok"}),
+            tags={"app": "support-bot"},
+            metadata={"app_version": "0.1.0"},
+            tags_builder=lambda runnable, inputs, response, error: {
+                "model": runnable.model,
+            },
+            metadata_builder=lambda runnable, inputs, response, error: {
+                "model_name": runnable.model,
+                "response_type": type(response).__name__,
+            },
+        )
+
+        result = asyncio.run(traced_llm.ainvoke({"question": "hello"}))
+
+        self.assertEqual(result, {"content": "ok"})
+        self.assertEqual(self.fake_mlflow.calls[-1]["tags"]["app"], "support-bot")
+        self.assertEqual(self.fake_mlflow.calls[-1]["tags"]["model"], "fake-llm")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["app_version"], "0.1.0")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["model_name"], "fake-llm")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["response_type"], "dict")
+
+    def test_trace_llm_supports_async_context_manager(self) -> None:
+        async def _run():
+            with_trace = trace_llm(
+                user_id="user-31",
+                session_id="session-31",
+                trace_name="context-trace",
+            )
+            self.assertIsInstance(with_trace, TraceSession)
+            async with with_trace as trace:
+                trace.set_request({"question": "hello"})
+                response = await _FakeRunnable({"answer": "ok"}).ainvoke({"question": "hello"})
+                trace.set_response(response)
+                return response
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result, {"answer": "ok"})
+        self.assertEqual(self.fake_mlflow.started_spans[0]["name"], "context-trace")
+        self.assertEqual(self.fake_mlflow.calls[-1]["response_preview"], "ok")
+        span = self.fake_mlflow.started_spans[-1]["context"]
+        self.assertEqual(span.inputs, {"question": "hello"})
+        self.assertEqual(span.outputs, {"answer": "ok"})
+
+    def test_trace_llm_can_add_tags_and_metadata_after_llm_call(self) -> None:
+        llm = _FakeRunnable({"content": "ok"})
+
+        async def _run():
+            async with trace_llm(
+                user_id="user-31",
+                session_id="session-31",
+                tags={"app": "support-bot"},
+                metadata={"app_version": "0.1.0"},
+                trace_name="context-trace-update",
+            ) as trace:
+                trace.set_request({"question": "hello"})
+                response = await llm.ainvoke({"question": "hello"})
+                trace.add_tags({"model": llm.model})
+                trace.add_metadata(
+                    {
+                        "model_name": llm.model,
+                        "response_type": type(response).__name__,
+                    }
+                )
+                trace.set_response(response)
+                return response
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result, {"content": "ok"})
+        self.assertEqual(self.fake_mlflow.calls[-1]["tags"]["app"], "support-bot")
+        self.assertEqual(self.fake_mlflow.calls[-1]["tags"]["model"], "fake-llm")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["app_version"], "0.1.0")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["model_name"], "fake-llm")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["response_type"], "dict")
+
+    def test_trace_llm_call_wraps_async_function(self) -> None:
+        runnable = _FakeRunnable({"answer": "ok"})
+
+        @trace_llm_call(
+            user_id="user-32",
+            session_id="session-32",
+            trace_name="decorated-trace",
+        )
+        async def agent(llm, input):
+            return await llm.ainvoke(input)
+
+        result = asyncio.run(agent(runnable, {"question": "hello"}))
+
+        self.assertEqual(result, {"answer": "ok"})
+        self.assertEqual(self.fake_mlflow.started_spans[0]["name"], "decorated-trace")
+        self.assertEqual(self.fake_mlflow.calls[-1]["request_preview"], "hello")
+        self.assertEqual(self.fake_mlflow.calls[-1]["response_preview"], "ok")
+
+    def test_trace_llm_call_supports_custom_request_resolver(self) -> None:
+        runnable = _FakeRunnable({"answer": "ok"})
+
+        @trace_llm_call(
+            user_id="user-33",
+            request_resolver=lambda llm, payload, extra=None: payload["actual_input"],
+        )
+        async def agent(llm, payload, extra=None):
+            return await llm.ainvoke(payload["actual_input"])
+
+        result = asyncio.run(
+            agent(
+                runnable,
+                {"actual_input": {"question": "hello"}},
+                extra="ignored",
+            )
+        )
+
+        self.assertEqual(result, {"answer": "ok"})
+        self.assertEqual(self.fake_mlflow.calls[-1]["request_preview"], "hello")
 
 
 class EnrichmentTests(unittest.TestCase):
