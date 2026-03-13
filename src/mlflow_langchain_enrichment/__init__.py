@@ -1,3 +1,4 @@
+from .agent import auto_trace_agent
 from .auto import (
     close_root_trace,
     close_trace_context,
@@ -26,6 +27,7 @@ __all__ = [
     "TraceContext",
     "TraceSession",
     "ainvoke_with_enrichment",
+    "auto_trace_agent",
     "auto_trace_chain",
     "auto_trace_llm",
     "auto_trace_runnable",

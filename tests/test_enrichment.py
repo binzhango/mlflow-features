@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import json
 import sys
 import unittest
+from typing import Any
 
+from deepagents import create_deep_agent
 from deepagents.graph import resolve_model
+from langchain.agents import create_agent
 from mlflow_langchain_enrichment import (
     TraceContext,
     TraceSession,
+    auto_trace_agent,
     auto_trace_llm,
     auto_trace_chain,
     close_root_trace,
@@ -23,7 +29,7 @@ from mlflow_langchain_enrichment import (
 )
 from langchain_core.callbacks.manager import CallbackManager
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from mlflow_langchain_enrichment.auto import (
@@ -47,6 +53,11 @@ class _FakeMlflow:
         self.started_runs: list[dict] = []
         self._active_run = None
         self.started_spans: list[dict] = []
+        self._span_stack: contextvars.ContextVar[tuple[dict[str, Any], ...]] = (
+            contextvars.ContextVar("fake_mlflow_span_stack", default=())
+        )
+        self._next_span_id = 1
+        self._next_trace_id = 1
 
     def update_current_trace(self, **kwargs):
         self.calls.append(kwargs)
@@ -70,7 +81,18 @@ class _FakeMlflow:
         return _RunContext()
 
     def start_span(self, **kwargs):
-        self.started_spans.append(kwargs)
+        span_record = dict(kwargs)
+        span_record["span_id"] = self._next_span_id
+        self._next_span_id += 1
+        current_stack = self._span_stack.get()
+        parent = current_stack[-1] if current_stack else None
+        span_record["parent_span_id"] = None if parent is None else parent["span_id"]
+        if parent is None:
+            span_record["trace_id"] = self._next_trace_id
+            self._next_trace_id += 1
+        else:
+            span_record["trace_id"] = parent["trace_id"]
+        self.started_spans.append(span_record)
         fake_mlflow = self
 
         class _SpanContext:
@@ -79,9 +101,13 @@ class _FakeMlflow:
                 self_inner.outputs = None
                 self_inner.attributes = {}
                 fake_mlflow.started_spans[-1]["context"] = self_inner
+                self_inner._span_stack_token = fake_mlflow._span_stack.set(
+                    (*fake_mlflow._span_stack.get(), fake_mlflow.started_spans[-1])
+                )
                 return self_inner
 
             def __exit__(self_inner, exc_type, exc, tb):
+                fake_mlflow._span_stack.reset(self_inner._span_stack_token)
                 return False
 
             def set_inputs(self_inner, inputs):
@@ -95,6 +121,9 @@ class _FakeMlflow:
 
             def set_attributes(self_inner, attributes):
                 self_inner.attributes.update(attributes)
+
+            def set_span_type(self_inner, span_type):
+                self_inner.attributes["mlflow.spanType"] = span_type
 
         return _SpanContext()
 
@@ -156,6 +185,143 @@ class _FakeChatModel(BaseChatModel):
 
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         return _FakeRunnable(AIMessage(content="tool-ok"))
+
+
+class _StaticChatModel(BaseChatModel):
+    response_text: str = "ok"
+    model_name: str = "static-chat"
+    usage_metadata: dict[str, int] | None = None
+
+    @property
+    def _llm_type(self) -> str:
+        return "static-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content=self.response_text,
+                        response_metadata={"model": self.model_name},
+                        usage_metadata=self.usage_metadata,
+                    ),
+                )
+            ]
+        )
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return self
+
+
+class _SupervisorToolCallingChatModel(BaseChatModel):
+    tool_name: str = "ask_child_agent"
+
+    @property
+    def _llm_type(self) -> str:
+        return "supervisor-tool-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        saw_tool_response = any(isinstance(message, ToolMessage) for message in messages)
+        if not saw_tool_response:
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": self.tool_name,
+                                    "args": {"question": "delegate this"},
+                                    "id": "tool-call-1",
+                                    "type": "tool_call",
+                                }
+                            ],
+                        )
+                    )
+                ]
+            )
+
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(content="supervisor-final"),
+                )
+            ]
+        )
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return self
+
+
+class _DeepAgentTaskCallingChatModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "deepagent-task-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        saw_tool_response = any(isinstance(message, ToolMessage) for message in messages)
+        if not saw_tool_response:
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": "task",
+                                    "args": {
+                                        "description": "Research the issue and return a short summary.",
+                                        "subagent_type": "research-subagent",
+                                    },
+                                    "id": "task-call-1",
+                                    "type": "tool_call",
+                                }
+                            ],
+                        )
+                    )
+                ]
+            )
+
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(content="deepagent-final"),
+                )
+            ]
+        )
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return self
+
+
+class _FlakyChatModel(BaseChatModel):
+    failures_before_success: int = 1
+    attempts: int = 0
+    model_name: str = "flaky-model"
+    usage_metadata: dict[str, int] | None = None
+
+    @property
+    def _llm_type(self) -> str:
+        return "flaky-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.attempts += 1
+        if self.attempts <= self.failures_before_success:
+            raise ConnectionError(f"transient-{self.attempts}")
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="recovered",
+                        response_metadata={"model": self.model_name},
+                        usage_metadata=self.usage_metadata,
+                    )
+                )
+            ]
+        )
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return self
 
 
 class ErgonomicApiTests(unittest.TestCase):
@@ -267,6 +433,34 @@ class ErgonomicApiTests(unittest.TestCase):
         self.assertEqual(
             span.attributes["mlflow.chat.tokenUsage"],
             {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
+        )
+
+    def test_auto_trace_llm_records_generate_path_token_usage(self) -> None:
+        traced_llm = auto_trace_llm(
+            _StaticChatModel(
+                response_text="generated",
+                model_name="generate-model",
+                usage_metadata={
+                    "input_tokens": 8,
+                    "output_tokens": 9,
+                    "total_tokens": 17,
+                },
+            ),
+            session_id="session-generate-token-usage",
+            trace_name="generate-token-usage",
+        )
+
+        result = traced_llm.generate([[HumanMessage(content="hello")]])
+
+        self.assertEqual(result.generations[0][0].message.content, "generated")
+        self.assertEqual(
+            self.fake_mlflow.calls[-1]["metadata"]["mlflow.trace.tokenUsage"],
+            '{"input_tokens":8,"output_tokens":9,"total_tokens":17}',
+        )
+        span = self.fake_mlflow.started_spans[-1]["context"]
+        self.assertEqual(
+            span.attributes["mlflow.chat.tokenUsage"],
+            {"input_tokens": 8, "output_tokens": 9, "total_tokens": 17},
         )
 
     def test_auto_trace_chain_wraps_raw_ainvoke(self) -> None:
@@ -408,6 +602,195 @@ class ErgonomicApiTests(unittest.TestCase):
 
         self.assertEqual(result, {"answer": "ok"})
         self.assertEqual(self.fake_mlflow.calls[-1]["request_preview"], "hello")
+
+    def test_auto_trace_agent_nests_manual_subagent_and_llm_spans_in_one_trace(self) -> None:
+        session_id = "session-agent"
+        user_id = "user-agent"
+
+        child_model = auto_trace_llm(
+            _StaticChatModel(
+                response_text="child-answer",
+                model_name="child-test-model",
+                usage_metadata={
+                    "input_tokens": 4,
+                    "output_tokens": 6,
+                    "total_tokens": 10,
+                },
+            ),
+            session_id=session_id,
+            user_id=user_id,
+            trace_name="child-model",
+        )
+        child_agent = auto_trace_agent(
+            create_agent(model=child_model, tools=[], name="billing-subagent"),
+            session_id=session_id,
+            user_id=user_id,
+        )
+
+        async def ask_child_agent(question: str) -> str:
+            """Delegate the question to the child agent."""
+            result = await child_agent.ainvoke(
+                {"messages": [{"role": "user", "content": question}]}
+            )
+            return result["messages"][-1].content
+
+        supervisor_model = auto_trace_llm(
+            _SupervisorToolCallingChatModel(tool_name="ask_child_agent"),
+            session_id=session_id,
+            user_id=user_id,
+            trace_name="supervisor-model",
+        )
+        supervisor_agent = auto_trace_agent(
+            create_agent(
+                model=supervisor_model,
+                tools=[ask_child_agent],
+                name="supervisor-agent",
+            ),
+            session_id=session_id,
+            user_id=user_id,
+        )
+
+        result = asyncio.run(
+            supervisor_agent.ainvoke(
+                {"messages": [{"role": "user", "content": "Please delegate this"}]}
+            )
+        )
+
+        self.assertEqual(result["messages"][-1].content, "supervisor-final")
+        span_names = [span["name"] for span in self.fake_mlflow.started_spans]
+        self.assertIn("supervisor-agent", span_names)
+        self.assertIn("billing-subagent", span_names)
+        self.assertIn("supervisor-model", span_names)
+        self.assertIn("child-model", span_names)
+        self.assertEqual({span["trace_id"] for span in self.fake_mlflow.started_spans}, {1})
+
+        supervisor_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "supervisor-agent"
+        )
+        subagent_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "billing-subagent"
+        )
+        self.assertEqual(subagent_span["parent_span_id"], supervisor_span["span_id"])
+        self.assertEqual(subagent_span["context"].attributes["agent_name"], "billing-subagent")
+        self.assertEqual(subagent_span["context"].attributes["agent_type"], "subagent")
+        self.assertEqual(subagent_span["context"].attributes["mlflow.spanType"], "AGENT")
+        self.assertEqual(
+            subagent_span["context"].attributes["parent_agent_name"],
+            "supervisor-agent",
+        )
+        self.assertEqual(subagent_span["context"].attributes["model_name"], "child-test-model")
+        self.assertEqual(
+            subagent_span["context"].attributes["mlflow.llm.model"],
+            "child-test-model",
+        )
+        self.assertEqual(
+            subagent_span["context"].attributes["mlflow.chat.tokenUsage"],
+            {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+        )
+        self.assertEqual(subagent_span["context"].attributes["input_tokens"], 4)
+        self.assertEqual(subagent_span["context"].attributes["output_tokens"], 6)
+        self.assertEqual(subagent_span["context"].attributes["total_tokens"], 10)
+        self.assertEqual(
+            subagent_span["context"].outputs["messages"][-1]["content"],
+            "child-answer",
+        )
+        self.assertEqual(subagent_span["context"].outputs["content"], "child-answer")
+        self.assertEqual(
+            subagent_span["context"].outputs["response_metadata"]["model"],
+            "child-test-model",
+        )
+        self.assertEqual(
+            subagent_span["context"].outputs["usage_metadata"],
+            {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+        )
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["agent_name"], "supervisor-agent")
+
+    def test_auto_trace_agent_keeps_parallel_child_calls_in_same_trace(self) -> None:
+        session_id = "session-parallel"
+        user_id = "user-parallel"
+        child_agent = auto_trace_agent(
+            create_agent(
+                model=auto_trace_llm(
+                    _StaticChatModel(
+                        response_text="parallel-child",
+                        model_name="parallel-child-model-name",
+                        usage_metadata={
+                            "input_tokens": 2,
+                            "output_tokens": 3,
+                            "total_tokens": 5,
+                        },
+                    ),
+                    session_id=session_id,
+                    user_id=user_id,
+                    trace_name="parallel-child-model",
+                ),
+                tools=[],
+                name="billing-subagent",
+            ),
+            session_id=session_id,
+            user_id=user_id,
+        )
+
+        async def _run() -> Any:
+            with using_root_trace(
+                session_id=session_id,
+                user_id=user_id,
+                trace_name="supervisor-root",
+            ) as trace:
+                trace.request = {"messages": [{"role": "user", "content": "run in parallel"}]}
+                result = await asyncio.gather(
+                    child_agent.ainvoke(
+                        {"messages": [{"role": "user", "content": "first"}]}
+                    ),
+                    child_agent.ainvoke(
+                        {"messages": [{"role": "user", "content": "second"}]}
+                    ),
+                )
+                trace.response = result
+                return result
+
+        results = asyncio.run(_run())
+
+        self.assertEqual(len(results), 2)
+        root_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "supervisor-root"
+        )
+        child_spans = [
+            span for span in self.fake_mlflow.started_spans if span["name"] == "billing-subagent"
+        ]
+        self.assertEqual(len(child_spans), 2)
+        self.assertTrue(all(span["trace_id"] == root_span["trace_id"] for span in child_spans))
+        self.assertTrue(all(span["parent_span_id"] == root_span["span_id"] for span in child_spans))
+        self.assertEqual(
+            root_span["context"].attributes["mlflow.chat.tokenUsage"],
+            {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+        )
+        self.assertEqual(root_span["context"].attributes["input_tokens"], 4)
+        self.assertEqual(root_span["context"].attributes["output_tokens"], 6)
+        self.assertEqual(root_span["context"].attributes["total_tokens"], 10)
+        self.assertEqual(
+            self.fake_mlflow.calls[-1]["metadata"]["mlflow.trace.tokenUsage"],
+            '{"input_tokens":4,"output_tokens":6,"total_tokens":10}',
+        )
+        ledger = self.fake_mlflow.calls[-1]["metadata"]["mlflow_langchain_enrichment.tokenUsageByCall"]
+        parsed_ledger = json.loads(ledger)
+        self.assertEqual(len(parsed_ledger), 2)
+        self.assertTrue(all(key.startswith("call_") for key in parsed_ledger))
+        self.assertTrue(
+            all(
+                entry == {
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "total_tokens": 5,
+                    "span_name": "parallel-child-model",
+                    "model_name": "parallel-child-model-name",
+                }
+                for entry in parsed_ledger.values()
+            )
+        )
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["input_tokens"], "4")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["output_tokens"], "6")
+        self.assertEqual(self.fake_mlflow.calls[-1]["metadata"]["total_tokens"], "10")
 
 
 class EnrichmentTests(unittest.TestCase):
@@ -629,6 +1012,164 @@ class EnrichmentTests(unittest.TestCase):
         span = self.fake_mlflow.started_spans[-1]["context"]
         self.assertIsNone(span.inputs)
         self.assertIsNone(span.outputs)
+
+    def test_auto_trace_agent_retrofits_deepagents_subagent_graphs_and_model_retries(self) -> None:
+        deep_agent = create_deep_agent(
+            model=_StaticChatModel(response_text="supervisor"),
+            tools=[],
+            subagents=[
+                {
+                    "name": "research-subagent",
+                    "description": "Research worker",
+                    "system_prompt": "Do research",
+                    "model": _StaticChatModel(response_text="research"),
+                    "tools": [],
+                }
+            ],
+            name="deep-supervisor",
+        )
+
+        traced_agent = auto_trace_agent(
+            deep_agent,
+            session_id="session-deep",
+            user_id="user-deep",
+        )
+
+        self.assertEqual(
+            traced_agent.runnable.builder.nodes["model"].retry_policy.max_attempts,
+            3,
+        )
+
+        task_tool = traced_agent.runnable.builder.nodes["tools"].runnable._tools_by_name["task"]
+        subagent_graphs = None
+        for func in (getattr(task_tool.func, "__wrapped__", task_tool.func), getattr(task_tool.coroutine, "__wrapped__", task_tool.coroutine)):
+            for name, cell in zip(func.__code__.co_freevars, func.__closure__ or [], strict=False):
+                if name == "subagent_graphs":
+                    subagent_graphs = cell.cell_contents
+                    break
+            if subagent_graphs is not None:
+                break
+
+        self.assertIsNotNone(subagent_graphs)
+        wrapped_subagent = subagent_graphs["research-subagent"]
+        self.assertEqual(type(wrapped_subagent).__name__, "TracedAgentRunnable")
+        self.assertEqual(wrapped_subagent.agent_name, "research-subagent")
+        self.assertEqual(
+            wrapped_subagent.runnable.builder.nodes["model"].retry_policy.max_attempts,
+            3,
+        )
+
+    def test_auto_trace_agent_deepagents_run_emits_named_subagent_child_span(self) -> None:
+        traced_agent = auto_trace_agent(
+            create_deep_agent(
+                model=auto_trace_llm(
+                    _DeepAgentTaskCallingChatModel(),
+                    session_id="session-deep-run",
+                    user_id="user-deep-run",
+                    trace_name="deep-supervisor-model",
+                ),
+                tools=[],
+                subagents=[
+                    {
+                        "name": "research-subagent",
+                        "description": "Research worker",
+                        "system_prompt": "Do research",
+                        "model": auto_trace_llm(
+                            _StaticChatModel(
+                                response_text="research-result",
+                                model_name="research-model",
+                                usage_metadata={
+                                    "input_tokens": 3,
+                                    "output_tokens": 4,
+                                    "total_tokens": 7,
+                                },
+                            ),
+                            session_id="session-deep-run",
+                            user_id="user-deep-run",
+                            trace_name="research-model",
+                        ),
+                        "tools": [],
+                    }
+                ],
+                name="deep-supervisor",
+            ),
+            session_id="session-deep-run",
+            user_id="user-deep-run",
+        )
+
+        result = asyncio.run(
+            traced_agent.ainvoke(
+                {"messages": [{"role": "user", "content": "Please research this"}]}
+            )
+        )
+
+        self.assertEqual(result["messages"][-1].content, "deepagent-final")
+        supervisor_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "deep-supervisor"
+        )
+        subagent_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "research-subagent"
+        )
+        self.assertEqual(subagent_span["trace_id"], supervisor_span["trace_id"])
+        self.assertEqual(subagent_span["parent_span_id"], supervisor_span["span_id"])
+        self.assertEqual(subagent_span["context"].attributes["agent_name"], "research-subagent")
+        self.assertEqual(subagent_span["context"].attributes["agent_type"], "subagent")
+        self.assertEqual(subagent_span["context"].outputs["content"], "research-result")
+
+    def test_auto_trace_agent_retry_attempts_create_multiple_model_spans_but_one_usage_entry(self) -> None:
+        flaky_model = _FlakyChatModel(
+            failures_before_success=1,
+            usage_metadata={
+                "input_tokens": 11,
+                "output_tokens": 13,
+                "total_tokens": 24,
+            },
+        )
+        traced_agent = auto_trace_agent(
+            create_agent(
+                model=auto_trace_llm(
+                    flaky_model,
+                    session_id="session-retry",
+                    user_id="user-retry",
+                    trace_name="flaky-model-span",
+                ),
+                tools=[],
+                name="retry-agent",
+            ),
+            session_id="session-retry",
+            user_id="user-retry",
+            model_max_retries=3,
+        )
+
+        result = asyncio.run(
+            traced_agent.ainvoke(
+                {"messages": [{"role": "user", "content": "retry please"}]}
+            )
+        )
+
+        self.assertEqual(result["messages"][-1].content, "recovered")
+        self.assertEqual(flaky_model.attempts, 2)
+        model_spans = [
+            span for span in self.fake_mlflow.started_spans if span["name"] == "flaky-model-span"
+        ]
+        self.assertEqual(len(model_spans), 2)
+        self.assertIn("error", model_spans[0]["context"].outputs)
+        self.assertEqual(model_spans[1]["context"].outputs["content"], "recovered")
+
+        ledger = json.loads(
+            self.fake_mlflow.calls[-1]["metadata"]["mlflow_langchain_enrichment.tokenUsageByCall"]
+        )
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(
+            next(iter(ledger.values())),
+            {
+                "input_tokens": 11,
+                "output_tokens": 13,
+                "total_tokens": 24,
+                "span_name": "flaky-model-span",
+                "model_name": "flaky-model",
+            },
+        )
 
 
 if __name__ == "__main__":

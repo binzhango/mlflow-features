@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import json
 import threading
+import uuid
 import warnings
 from dataclasses import dataclass
 from collections.abc import Callable, Iterator, Mapping
@@ -27,6 +29,22 @@ _CURRENT_TRACE_CONTEXT: contextvars.ContextVar[TraceContext | None] = contextvar
     "mlflow_langchain_enrichment_trace_context",
     default=None,
 )
+_CURRENT_TRACE_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "mlflow_langchain_enrichment_trace_depth",
+    default=0,
+)
+_CURRENT_TRACE_TOKEN_USAGE_LEDGER: contextvars.ContextVar[
+    dict[str, dict[str, Any]] | None
+] = contextvars.ContextVar(
+    "mlflow_langchain_enrichment_trace_token_usage_ledger",
+    default=None,
+)
+_CURRENT_TRACE_TOKEN_USAGE_TOTALS: contextvars.ContextVar[
+    dict[str, int] | None
+] = contextvars.ContextVar(
+    "mlflow_langchain_enrichment_trace_token_usage_totals",
+    default=None,
+)
 _CONFIGURE_LOCK = threading.Lock()
 _PATCHED = False
 _TRACE_CONTEXT_PROVIDER: TraceContextProvider | None = None
@@ -47,6 +65,24 @@ class RootTraceHandle:
     trace_context_handle: TraceContextHandle
     span: Any
     exit_stack: contextlib.ExitStack
+    depth_token: contextvars.Token[int]
+    token_usage_token: contextvars.Token[dict[str, dict[str, Any]] | None]
+    token_totals_token: contextvars.Token[dict[str, int] | None]
+    request: Any = None
+    response: Any = None
+    error: BaseException | None = None
+
+
+@dataclass(slots=True)
+class InvocationTraceHandle:
+    trace_context: TraceContext
+    span: Any
+    exit_stack: contextlib.ExitStack
+    depth_token: contextvars.Token[int]
+    token_usage_token: contextvars.Token[dict[str, dict[str, Any]] | None] | None = None
+    token_totals_token: contextvars.Token[dict[str, int] | None] | None = None
+    trace_context_handle: TraceContextHandle | None = None
+    is_root: bool = False
     request: Any = None
     response: Any = None
     error: BaseException | None = None
@@ -137,6 +173,219 @@ def close_trace_context(handle: TraceContextHandle) -> None:
         reset_current_trace_context(handle.token)
 
 
+def get_current_trace_depth() -> int:
+    return _CURRENT_TRACE_DEPTH.get()
+
+
+def _push_trace_depth() -> contextvars.Token[int]:
+    current_depth = get_current_trace_depth()
+    return _CURRENT_TRACE_DEPTH.set(current_depth + 1)
+
+
+def _reset_trace_depth(token: contextvars.Token[int]) -> None:
+    _CURRENT_TRACE_DEPTH.reset(token)
+
+
+def get_current_trace_token_usage_ledger() -> dict[str, dict[str, Any]] | None:
+    ledger = _CURRENT_TRACE_TOKEN_USAGE_LEDGER.get()
+    if ledger is None:
+        return None
+    return {key: dict(value) for key, value in ledger.items()}
+
+
+def _push_trace_token_usage() -> contextvars.Token[dict[str, dict[str, Any]] | None]:
+    current_ledger = _CURRENT_TRACE_TOKEN_USAGE_LEDGER.get()
+    if current_ledger is None:
+        return _CURRENT_TRACE_TOKEN_USAGE_LEDGER.set({})
+    return _CURRENT_TRACE_TOKEN_USAGE_LEDGER.set(current_ledger)
+
+
+def _reset_trace_token_usage(token: contextvars.Token[dict[str, dict[str, Any]] | None]) -> None:
+    _CURRENT_TRACE_TOKEN_USAGE_LEDGER.reset(token)
+
+
+def get_current_trace_token_usage_totals() -> dict[str, int] | None:
+    totals = _CURRENT_TRACE_TOKEN_USAGE_TOTALS.get()
+    if totals is None:
+        return None
+    return dict(totals)
+
+
+def _push_trace_token_totals() -> contextvars.Token[dict[str, int] | None]:
+    current_totals = _CURRENT_TRACE_TOKEN_USAGE_TOTALS.get()
+    if current_totals is None:
+        return _CURRENT_TRACE_TOKEN_USAGE_TOTALS.set({})
+    return _CURRENT_TRACE_TOKEN_USAGE_TOTALS.set(current_totals)
+
+
+def _reset_trace_token_totals(token: contextvars.Token[dict[str, int] | None]) -> None:
+    _CURRENT_TRACE_TOKEN_USAGE_TOTALS.reset(token)
+
+
+def accumulate_current_trace_token_usage(usage: Mapping[str, Any]) -> None:
+    current = _CURRENT_TRACE_TOKEN_USAGE_TOTALS.get()
+    if current is None:
+        return
+
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            continue
+        current[key] = current.get(key, 0) + normalized
+
+
+def record_current_trace_token_usage(
+    usage: Mapping[str, Any],
+    *,
+    span_name: str | None = None,
+    model_name: str | None = None,
+) -> None:
+    current = _CURRENT_TRACE_TOKEN_USAGE_LEDGER.get()
+    if current is None:
+        return
+
+    normalized_usage: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            continue
+        normalized_usage[key] = normalized
+
+    if not normalized_usage:
+        return
+
+    entry_key = f"call_{uuid.uuid4().hex}"
+    entry: dict[str, Any] = dict(normalized_usage)
+    if span_name:
+        entry["span_name"] = span_name
+    if model_name:
+        entry["model_name"] = model_name
+    current[entry_key] = entry
+
+
+def _get_aggregated_trace_token_usage() -> dict[str, int]:
+    ledger = get_current_trace_token_usage_ledger() or {}
+    usage = get_current_trace_token_usage_totals() or {}
+    if not usage:
+        for entry in ledger.values():
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                value = entry.get(key)
+                if isinstance(value, int):
+                    usage[key] = usage.get(key, 0) + value
+    return usage
+
+
+def _set_span_token_usage_attributes(span: Any, usage: Mapping[str, int]) -> None:
+    if not usage:
+        return
+    attributes: dict[str, Any] = {"mlflow.chat.tokenUsage": dict(usage)}
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            attributes[key] = value
+
+    if hasattr(span, "set_attributes"):
+        span.set_attributes(attributes)
+        return
+    if hasattr(span, "set_attribute"):
+        for key, value in attributes.items():
+            span.set_attribute(key, value)
+
+
+def _trace_context_with_aggregated_token_usage(trace_context: TraceContext) -> TraceContext:
+    ledger = get_current_trace_token_usage_ledger() or {}
+    usage = _get_aggregated_trace_token_usage()
+
+    if not usage and not ledger:
+        return trace_context
+
+    metadata = dict(trace_context.metadata)
+    metadata["mlflow.trace.tokenUsage"] = json.dumps(
+        usage,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    metadata["mlflow_langchain_enrichment.tokenUsageByCall"] = json.dumps(
+        ledger,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    for key, value in usage.items():
+        metadata[key] = str(value)
+
+    if metadata == dict(trace_context.metadata):
+        return trace_context
+    return TraceContext(
+        tags=trace_context.tags,
+        metadata=metadata,
+        span_metadata=trace_context.span_metadata,
+        run_tags=trace_context.run_tags,
+        user_id=trace_context.user_id,
+        session_id=trace_context.session_id,
+        client_request_id=trace_context.client_request_id,
+        mlflow_run_name=trace_context.mlflow_run_name,
+        run_description=trace_context.run_description,
+        ensure_run=trace_context.ensure_run,
+        request_preview=trace_context.request_preview,
+        response_preview=trace_context.response_preview,
+        request_preview_builder=trace_context.request_preview_builder,
+        response_preview_builder=trace_context.response_preview_builder,
+        tags_builder=trace_context.tags_builder,
+        metadata_builder=trace_context.metadata_builder,
+        preview_limit=trace_context.preview_limit,
+        trace_name=trace_context.trace_name,
+        capture_root_span_io=trace_context.capture_root_span_io,
+    )
+
+
+def _record_span_result(
+    span: Any,
+    trace_context: TraceContext,
+    *,
+    request: Any = None,
+    response: Any = None,
+    error: BaseException | None = None,
+    update_trace: bool,
+) -> None:
+    if request is not None and trace_context.capture_root_span_io:
+        span.set_inputs(to_root_span_inputs(request))
+
+    if error is not None:
+        if trace_context.capture_root_span_io:
+            span.set_outputs({"error": f"{type(error).__name__}: {error}"})
+        if update_trace:
+            update_trace_from_context(
+                trace_context,
+                request=request,
+                response=f"{type(error).__name__}: {error}",
+                state="ERROR",
+            )
+        return
+
+    if response is not None:
+        if trace_context.capture_root_span_io:
+            span.set_outputs(to_root_span_outputs(response))
+        if update_trace:
+            update_trace_from_context(
+                trace_context,
+                request=request,
+                response=response,
+                state="OK",
+            )
+        return
+
+    if request is not None and update_trace:
+        update_trace_from_context(trace_context, request=request)
+
+
 def open_root_trace(
     trace_context: TraceContextLike = None,
     /,
@@ -152,12 +401,18 @@ def open_root_trace(
         span = exit_stack.enter_context(
             mlflow.start_span(name=resolved.trace_name or "request")
         )
+        depth_token = _push_trace_depth()
+        token_usage_token = _push_trace_token_usage()
+        token_totals_token = _push_trace_token_totals()
         update_trace_from_context(resolved)
         return RootTraceHandle(
             trace_context=resolved,
             trace_context_handle=trace_context_handle,
             span=span,
             exit_stack=exit_stack,
+            depth_token=depth_token,
+            token_usage_token=token_usage_token,
+            token_totals_token=token_totals_token,
         )
     except Exception:
         exit_stack.close()
@@ -172,44 +427,146 @@ def close_root_trace(
     response: Any = None,
     error: BaseException | None = None,
 ) -> None:
+    final_request = request if request is not None else handle.request
+    final_error = error if error is not None else handle.error
+    final_response = response if response is not None else handle.response
+    final_trace_context = _trace_context_with_aggregated_token_usage(handle.trace_context)
+    aggregated_usage = _get_aggregated_trace_token_usage()
     try:
-        final_request = request if request is not None else handle.request
-        final_error = error if error is not None else handle.error
-        final_response = response if response is not None else handle.response
-
-        if final_request is not None and handle.trace_context.capture_root_span_io:
-            handle.span.set_inputs(to_root_span_inputs(final_request))
-
-        if final_error is not None:
-            if handle.trace_context.capture_root_span_io:
-                handle.span.set_outputs(
-                    {"error": f"{type(final_error).__name__}: {final_error}"}
-                )
-            update_trace_from_context(
-                handle.trace_context,
-                request=final_request,
-                response=f"{type(final_error).__name__}: {final_error}",
-                state="ERROR",
-            )
-        elif final_response is not None:
-            if handle.trace_context.capture_root_span_io:
-                handle.span.set_outputs(to_root_span_outputs(final_response))
-            update_trace_from_context(
-                handle.trace_context,
-                request=final_request,
-                response=final_response,
-                state="OK",
-            )
-        elif final_request is not None:
-            update_trace_from_context(
-                handle.trace_context,
-                request=final_request,
-            )
+        handle.trace_context = final_trace_context
+        _set_span_token_usage_attributes(handle.span, aggregated_usage)
+        _record_span_result(
+            handle.span,
+            handle.trace_context,
+            request=final_request,
+            response=final_response,
+            error=final_error,
+            update_trace=True,
+        )
     finally:
         try:
-            handle.exit_stack.close()
+            try:
+                handle.exit_stack.close()
+                update_trace_from_context(
+                    final_trace_context,
+                    request=final_request,
+                    response=(
+                        f"{type(final_error).__name__}: {final_error}"
+                        if final_error is not None
+                        else final_response
+                    ),
+                    state="ERROR" if final_error is not None else "OK",
+                )
+            finally:
+                _reset_trace_depth(handle.depth_token)
+                _reset_trace_token_usage(handle.token_usage_token)
+                _reset_trace_token_totals(handle.token_totals_token)
         finally:
             close_trace_context(handle.trace_context_handle)
+
+
+def open_traced_span(
+    trace_context: TraceContextLike = None,
+    /,
+    **trace_context_kwargs: Any,
+) -> InvocationTraceHandle:
+    resolved = _build_trace_context(trace_context, **trace_context_kwargs)
+
+    if get_current_trace_depth() > 0 and get_current_trace_context() is not None:
+        import mlflow
+
+        exit_stack = contextlib.ExitStack()
+        span = exit_stack.enter_context(mlflow.start_span(name=resolved.trace_name or "request"))
+        depth_token = _push_trace_depth()
+        return InvocationTraceHandle(
+            trace_context=resolved,
+            span=span,
+            exit_stack=exit_stack,
+            depth_token=depth_token,
+            token_usage_token=None,
+            is_root=False,
+        )
+
+    resolved_root = _build_trace_context(trace_context, **trace_context_kwargs)
+    trace_context_handle = open_trace_context(resolved_root)
+    exit_stack = contextlib.ExitStack()
+
+    try:
+        import mlflow
+
+        span = exit_stack.enter_context(mlflow.start_span(name=resolved_root.trace_name or "request"))
+        depth_token = _push_trace_depth()
+        token_usage_token = _push_trace_token_usage()
+        token_totals_token = _push_trace_token_totals()
+        update_trace_from_context(resolved_root)
+        return InvocationTraceHandle(
+            trace_context=resolved_root,
+            span=span,
+            exit_stack=exit_stack,
+            depth_token=depth_token,
+            token_usage_token=token_usage_token,
+            token_totals_token=token_totals_token,
+            trace_context_handle=trace_context_handle,
+            is_root=True,
+        )
+    except Exception:
+        exit_stack.close()
+        close_trace_context(trace_context_handle)
+        raise
+
+
+def close_traced_span(
+    handle: InvocationTraceHandle,
+    *,
+    request: Any = None,
+    response: Any = None,
+    error: BaseException | None = None,
+) -> None:
+    final_request = request if request is not None else handle.request
+    final_error = error if error is not None else handle.error
+    final_response = response if response is not None else handle.response
+    final_trace_context = (
+        _trace_context_with_aggregated_token_usage(handle.trace_context)
+        if handle.is_root
+        else handle.trace_context
+    )
+    aggregated_usage = _get_aggregated_trace_token_usage() if handle.is_root else {}
+    try:
+        handle.trace_context = final_trace_context
+        if handle.is_root:
+            _set_span_token_usage_attributes(handle.span, aggregated_usage)
+        _record_span_result(
+            handle.span,
+            handle.trace_context,
+            request=final_request,
+            response=final_response,
+            error=final_error,
+            update_trace=handle.is_root,
+        )
+    finally:
+        try:
+            try:
+                handle.exit_stack.close()
+                if handle.is_root:
+                    update_trace_from_context(
+                        final_trace_context,
+                        request=final_request,
+                        response=(
+                            f"{type(final_error).__name__}: {final_error}"
+                            if final_error is not None
+                            else final_response
+                        ),
+                        state="ERROR" if final_error is not None else "OK",
+                    )
+            finally:
+                _reset_trace_depth(handle.depth_token)
+                if handle.token_usage_token is not None:
+                    _reset_trace_token_usage(handle.token_usage_token)
+                if handle.token_totals_token is not None:
+                    _reset_trace_token_totals(handle.token_totals_token)
+        finally:
+            if handle.trace_context_handle is not None:
+                close_trace_context(handle.trace_context_handle)
 
 
 @contextlib.contextmanager

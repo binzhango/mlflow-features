@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Iterator, Mapping
 
 from pydantic import ConfigDict, Field
 
-from .auto import close_root_trace, open_root_trace
+from .agent import has_current_agent_span, record_current_agent_model_observation
+from .auto import (
+    accumulate_current_trace_token_usage,
+    close_traced_span,
+    open_traced_span,
+    record_current_trace_token_usage,
+)
 from .enrichment import TraceContext, build_runnable_config
 
 try:
@@ -16,7 +22,6 @@ except ImportError:  # pragma: no cover - optional dependency at import time
 
 
 TraceContextLike = TraceContext | Mapping[str, Any] | None
-_TRACE_TOKEN_USAGE_METADATA_KEY = "mlflow.trace.tokenUsage"
 _CHAT_TOKEN_USAGE_ATTRIBUTE_KEY = "mlflow.chat.tokenUsage"
 _TOKEN_USAGE_KEYS = ("input_tokens", "output_tokens", "total_tokens")
 
@@ -146,22 +151,10 @@ def _trace_context_with_token_usage(
     trace_context: TraceContext,
     response: Any,
 ) -> TraceContext:
-    usage = _extract_token_usage(response)
-    if not usage:
-        return trace_context
-
-    metadata = dict(trace_context.metadata)
-    metadata[_TRACE_TOKEN_USAGE_METADATA_KEY] = json.dumps(
-        usage,
-        ensure_ascii=True,
-        separators=(",", ":"),
-    )
-    for key, value in usage.items():
-        metadata.setdefault(key, str(value))
-
-    if metadata == dict(trace_context.metadata):
-        return trace_context
-    return replace(trace_context, metadata=metadata)
+    # Reserve trace-level token metadata for root trace close only, using the
+    # accumulator in auto.py. This keeps mlflow.trace.tokenUsage from being
+    # overwritten mid-run by individual model calls.
+    return trace_context
 
 
 def _set_span_token_usage(span: Any, response: Any) -> None:
@@ -173,6 +166,46 @@ def _set_span_token_usage(span: Any, response: Any) -> None:
         return
     if hasattr(span, "set_attributes"):
         span.set_attributes({_CHAT_TOKEN_USAGE_ATTRIBUTE_KEY: usage})
+
+
+def _resolve_model_name_for_ledger(
+    runnable: Any,
+    trace_context: TraceContext,
+    response: Any,
+) -> str | None:
+    candidates = [
+        getattr(runnable, "model", None),
+        getattr(getattr(runnable, "bound", None), "model", None),
+        trace_context.metadata.get("model_name"),
+        trace_context.tags.get("model"),
+        getattr(response, "response_metadata", None),
+    ]
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+        if isinstance(candidate, Mapping):
+            model_name = candidate.get("model")
+            if isinstance(model_name, str) and model_name:
+                return model_name
+    return None
+
+
+def _record_trace_token_usage_for_result(
+    runnable: Any,
+    trace_context: TraceContext,
+    response: Any,
+) -> None:
+    usage = _extract_token_usage(response)
+    if not usage:
+        return
+    if not has_current_agent_span():
+        accumulate_current_trace_token_usage(usage)
+    record_current_trace_token_usage(
+        usage,
+        span_name=trace_context.trace_name,
+        model_name=_resolve_model_name_for_ledger(runnable, trace_context, response),
+    )
 
 
 class _StreamAccumulator:
@@ -268,13 +301,19 @@ class PlainTracedRunnable:
         config: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> Any:
-        handle = open_root_trace(self.trace_context)
+        handle = open_traced_span(self.trace_context)
         handle.request = inputs
         try:
             result = self.runnable.invoke(inputs, config=self._build_config(config), **kwargs)
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
+            _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+            record_current_agent_model_observation(
+                trace_context=handle.trace_context,
+                runnable=self.runnable,
+                response=result,
+            )
             handle.response = result
             return result
         except BaseException as exc:
@@ -282,7 +321,7 @@ class PlainTracedRunnable:
             handle.error = exc
             raise
         finally:
-            close_root_trace(handle)
+            close_traced_span(handle)
 
     async def ainvoke(
         self,
@@ -291,13 +330,19 @@ class PlainTracedRunnable:
         config: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> Any:
-        handle = open_root_trace(self.trace_context)
+        handle = open_traced_span(self.trace_context)
         handle.request = inputs
         try:
             result = await self.runnable.ainvoke(inputs, config=self._build_config(config), **kwargs)
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
+            _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+            record_current_agent_model_observation(
+                trace_context=handle.trace_context,
+                runnable=self.runnable,
+                response=result,
+            )
             handle.response = result
             return result
         except BaseException as exc:
@@ -305,7 +350,7 @@ class PlainTracedRunnable:
             handle.error = exc
             raise
         finally:
-            close_root_trace(handle)
+            close_traced_span(handle)
 
     def stream(
         self,
@@ -314,7 +359,7 @@ class PlainTracedRunnable:
         config: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> Iterator[Any]:
-        handle = open_root_trace(self.trace_context)
+        handle = open_traced_span(self.trace_context)
         handle.request = inputs
         accumulator = _StreamAccumulator()
 
@@ -323,7 +368,7 @@ class PlainTracedRunnable:
         except BaseException as exc:
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, error=exc)
             handle.error = exc
-            close_root_trace(handle)
+            close_traced_span(handle)
             raise
 
         def _stream() -> Iterator[Any]:
@@ -338,6 +383,12 @@ class PlainTracedRunnable:
                 )
                 handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
                 _set_span_token_usage(handle.span, result)
+                _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+                record_current_agent_model_observation(
+                    trace_context=handle.trace_context,
+                    runnable=self.runnable,
+                    response=result,
+                )
                 handle.response = result
             except BaseException as exc:
                 handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, error=exc)
@@ -355,8 +406,18 @@ class PlainTracedRunnable:
                         result,
                     )
                     _set_span_token_usage(handle.span, result)
+                    _record_trace_token_usage_for_result(
+                        self.runnable,
+                        handle.trace_context,
+                        result,
+                    )
+                    record_current_agent_model_observation(
+                        trace_context=handle.trace_context,
+                        runnable=self.runnable,
+                        response=result,
+                    )
                     handle.response = result
-                close_root_trace(handle)
+                close_traced_span(handle)
 
         return _stream()
 
@@ -367,7 +428,7 @@ class PlainTracedRunnable:
         config: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
-        handle = open_root_trace(self.trace_context)
+        handle = open_traced_span(self.trace_context)
         handle.request = inputs
         accumulator = _StreamAccumulator()
 
@@ -376,7 +437,7 @@ class PlainTracedRunnable:
         except BaseException as exc:
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, error=exc)
             handle.error = exc
-            close_root_trace(handle)
+            close_traced_span(handle)
             raise
 
         try:
@@ -387,6 +448,12 @@ class PlainTracedRunnable:
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
+            _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+            record_current_agent_model_observation(
+                trace_context=handle.trace_context,
+                runnable=self.runnable,
+                response=result,
+            )
             handle.response = result
         except BaseException as exc:
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, error=exc)
@@ -401,8 +468,14 @@ class PlainTracedRunnable:
                 )
                 handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
                 _set_span_token_usage(handle.span, result)
+                _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+                record_current_agent_model_observation(
+                    trace_context=handle.trace_context,
+                    runnable=self.runnable,
+                    response=result,
+                )
                 handle.response = result
-            close_root_trace(handle)
+            close_traced_span(handle)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.runnable, name)
@@ -495,12 +568,35 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         run_manager: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        return self.runnable._generate(
-            messages,
-            stop=stop,
-            run_manager=run_manager,
-            **kwargs,
-        )
+        handle = open_traced_span(self.trace_context)
+        handle.request = messages
+        try:
+            result = self.runnable._generate(
+                messages,
+                stop=stop,
+                run_manager=run_manager,
+                **kwargs,
+            )
+            handle.trace_context = self._apply_dynamic_trace_attributes(
+                inputs=messages,
+                response=result,
+            )
+            handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
+            _set_span_token_usage(handle.span, result)
+            _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+            record_current_agent_model_observation(
+                trace_context=handle.trace_context,
+                runnable=self.runnable,
+                response=result,
+            )
+            handle.response = result
+            return result
+        except BaseException as exc:
+            handle.trace_context = self._apply_dynamic_trace_attributes(inputs=messages, error=exc)
+            handle.error = exc
+            raise
+        finally:
+            close_traced_span(handle)
 
     async def _agenerate(
         self,
@@ -509,12 +605,35 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         run_manager: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        return await self.runnable._agenerate(
-            messages,
-            stop=stop,
-            run_manager=run_manager,
-            **kwargs,
-        )
+        handle = open_traced_span(self.trace_context)
+        handle.request = messages
+        try:
+            result = await self.runnable._agenerate(
+                messages,
+                stop=stop,
+                run_manager=run_manager,
+                **kwargs,
+            )
+            handle.trace_context = self._apply_dynamic_trace_attributes(
+                inputs=messages,
+                response=result,
+            )
+            handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
+            _set_span_token_usage(handle.span, result)
+            _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+            record_current_agent_model_observation(
+                trace_context=handle.trace_context,
+                runnable=self.runnable,
+                response=result,
+            )
+            handle.response = result
+            return result
+        except BaseException as exc:
+            handle.trace_context = self._apply_dynamic_trace_attributes(inputs=messages, error=exc)
+            handle.error = exc
+            raise
+        finally:
+            close_traced_span(handle)
 
     def invoke(
         self,
@@ -524,7 +643,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> Any:
-        handle = open_root_trace(self.trace_context)
+        handle = open_traced_span(self.trace_context)
         handle.request = inputs
         try:
             result = self.runnable.invoke(
@@ -536,6 +655,12 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
+            _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+            record_current_agent_model_observation(
+                trace_context=handle.trace_context,
+                runnable=self.runnable,
+                response=result,
+            )
             handle.response = result
             return result
         except BaseException as exc:
@@ -543,7 +668,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
             handle.error = exc
             raise
         finally:
-            close_root_trace(handle)
+            close_traced_span(handle)
 
     async def ainvoke(
         self,
@@ -553,7 +678,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> Any:
-        handle = open_root_trace(self.trace_context)
+        handle = open_traced_span(self.trace_context)
         handle.request = inputs
         try:
             result = await self.runnable.ainvoke(
@@ -565,6 +690,12 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
+            _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+            record_current_agent_model_observation(
+                trace_context=handle.trace_context,
+                runnable=self.runnable,
+                response=result,
+            )
             handle.response = result
             return result
         except BaseException as exc:
@@ -572,7 +703,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
             handle.error = exc
             raise
         finally:
-            close_root_trace(handle)
+            close_traced_span(handle)
 
     def stream(
         self,
@@ -582,7 +713,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> Iterator[Any]:
-        handle = open_root_trace(self.trace_context)
+        handle = open_traced_span(self.trace_context)
         handle.request = inputs
         accumulator = _StreamAccumulator()
 
@@ -596,7 +727,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         except BaseException as exc:
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, error=exc)
             handle.error = exc
-            close_root_trace(handle)
+            close_traced_span(handle)
             raise
 
         def _stream() -> Iterator[Any]:
@@ -611,6 +742,12 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                 )
                 handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
                 _set_span_token_usage(handle.span, result)
+                _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+                record_current_agent_model_observation(
+                    trace_context=handle.trace_context,
+                    runnable=self.runnable,
+                    response=result,
+                )
                 handle.response = result
             except BaseException as exc:
                 handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, error=exc)
@@ -628,8 +765,18 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                         result,
                     )
                     _set_span_token_usage(handle.span, result)
+                    _record_trace_token_usage_for_result(
+                        self.runnable,
+                        handle.trace_context,
+                        result,
+                    )
+                    record_current_agent_model_observation(
+                        trace_context=handle.trace_context,
+                        runnable=self.runnable,
+                        response=result,
+                    )
                     handle.response = result
-                close_root_trace(handle)
+                close_traced_span(handle)
 
         return _stream()
 
@@ -641,7 +788,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
-        handle = open_root_trace(self.trace_context)
+        handle = open_traced_span(self.trace_context)
         handle.request = inputs
         accumulator = _StreamAccumulator()
 
@@ -655,7 +802,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         except BaseException as exc:
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, error=exc)
             handle.error = exc
-            close_root_trace(handle)
+            close_traced_span(handle)
             raise
 
         try:
@@ -666,6 +813,12 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
+            _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+            record_current_agent_model_observation(
+                trace_context=handle.trace_context,
+                runnable=self.runnable,
+                response=result,
+            )
             handle.response = result
         except BaseException as exc:
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, error=exc)
@@ -680,8 +833,14 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                 )
                 handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
                 _set_span_token_usage(handle.span, result)
+                _record_trace_token_usage_for_result(self.runnable, handle.trace_context, result)
+                record_current_agent_model_observation(
+                    trace_context=handle.trace_context,
+                    runnable=self.runnable,
+                    response=result,
+                )
                 handle.response = result
-            close_root_trace(handle)
+            close_traced_span(handle)
 
     def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any) -> Any:
         bound = self.runnable.bind_tools(tools, tool_choice=tool_choice, **kwargs)
