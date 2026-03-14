@@ -1112,6 +1112,7 @@ class EnrichmentTests(unittest.TestCase):
         supervisor_span = next(
             span for span in self.fake_mlflow.started_spans if span["name"] == "deep-supervisor"
         )
+        self.assertEqual(supervisor_span["context"].attributes["mlflow.spanType"], "CHAIN")
         subagent_spans = [
             span for span in self.fake_mlflow.started_spans if span["name"] == "research-subagent"
         ]
@@ -1126,7 +1127,7 @@ class EnrichmentTests(unittest.TestCase):
         self.assertEqual(outer_subagent_span["context"].attributes["agent_name"], "research-subagent")
         self.assertEqual(outer_subagent_span["context"].attributes["agent_type"], "subagent")
         self.assertEqual(outer_subagent_span["context"].attributes["mlflow.spanType"], "AGENT")
-        self.assertEqual(inner_subagent_span["context"].attributes["mlflow.spanType"], "CHAT_MODEL")
+        self.assertEqual(inner_subagent_span["context"].attributes["mlflow.spanType"], "AGENT")
         self.assertEqual(inner_subagent_span["context"].outputs["content"], "research-result")
         supervisor_model_spans = [
             span for span in self.fake_mlflow.started_spans if span["name"] == "deep-supervisor-model"

@@ -26,7 +26,7 @@ _CHAT_TOKEN_USAGE_ATTRIBUTE_KEY = "mlflow.chat.tokenUsage"
 _LLM_MODEL_ATTRIBUTE_KEY = "mlflow.llm.model"
 _TOKEN_USAGE_KEYS = ("input_tokens", "output_tokens", "total_tokens")
 _AGENT_SPAN_TYPE = "AGENT"
-_CHAT_MODEL_SPAN_TYPE = "CHAT_MODEL"
+_CHAIN_SPAN_TYPE = "CHAIN"
 _CURRENT_AGENT_EXECUTION: contextvars.ContextVar["AgentExecutionContext | None"] = (
     contextvars.ContextVar(
         "mlflow_langchain_enrichment_agent_execution",
@@ -180,11 +180,11 @@ def _set_span_type(span: Any, span_type: str) -> None:
 
 def _resolve_agent_span_type(
     *,
-    agent_name: str,
     parent_agent_name: str | None,
+    agent_type: str,
 ) -> str:
-    if parent_agent_name == agent_name:
-        return _CHAT_MODEL_SPAN_TYPE
+    if parent_agent_name is None and agent_type == "agent":
+        return _CHAIN_SPAN_TYPE
     return _AGENT_SPAN_TYPE
 
 
@@ -649,8 +649,8 @@ class TracedAgentRunnable:
                 "parent_agent_name": parent_agent_name,
                 "tool_call_id": tool_call_id,
                 "span_type": _resolve_agent_span_type(
-                    agent_name=effective_name,
                     parent_agent_name=parent_agent_name,
+                    agent_type=effective_type,
                 ),
             },
         )
