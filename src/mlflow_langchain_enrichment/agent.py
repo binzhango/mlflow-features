@@ -26,6 +26,7 @@ _CHAT_TOKEN_USAGE_ATTRIBUTE_KEY = "mlflow.chat.tokenUsage"
 _LLM_MODEL_ATTRIBUTE_KEY = "mlflow.llm.model"
 _TOKEN_USAGE_KEYS = ("input_tokens", "output_tokens", "total_tokens")
 _AGENT_SPAN_TYPE = "AGENT"
+_CHAT_MODEL_SPAN_TYPE = "CHAT_MODEL"
 _CURRENT_AGENT_EXECUTION: contextvars.ContextVar["AgentExecutionContext | None"] = (
     contextvars.ContextVar(
         "mlflow_langchain_enrichment_agent_execution",
@@ -175,6 +176,16 @@ def _set_span_attributes(span: Any, attributes: Mapping[str, Any]) -> None:
 def _set_span_type(span: Any, span_type: str) -> None:
     if hasattr(span, "set_span_type"):
         span.set_span_type(span_type)
+
+
+def _resolve_agent_span_type(
+    *,
+    agent_name: str,
+    parent_agent_name: str | None,
+) -> str:
+    if parent_agent_name == agent_name:
+        return _CHAT_MODEL_SPAN_TYPE
+    return _AGENT_SPAN_TYPE
 
 
 def _resolve_model_name(
@@ -637,6 +648,10 @@ class TracedAgentRunnable:
                 "agent_type": effective_type,
                 "parent_agent_name": parent_agent_name,
                 "tool_call_id": tool_call_id,
+                "span_type": _resolve_agent_span_type(
+                    agent_name=effective_name,
+                    parent_agent_name=parent_agent_name,
+                ),
             },
         )
 
@@ -686,7 +701,7 @@ class TracedAgentRunnable:
         effective_trace_context, agent_metadata = self._build_effective_trace_context()
         handle = open_traced_span(effective_trace_context)
         handle.request = inputs
-        _set_span_type(handle.span, _AGENT_SPAN_TYPE)
+        _set_span_type(handle.span, str(agent_metadata["span_type"]))
         _set_span_attributes(handle.span, agent_metadata)
         span_token = _push_current_agent_span(handle.span)
         binding = _CURRENT_AGENT_SPAN_STACK.get()[-1]
@@ -723,7 +738,7 @@ class TracedAgentRunnable:
         effective_trace_context, agent_metadata = self._build_effective_trace_context()
         handle = open_traced_span(effective_trace_context)
         handle.request = inputs
-        _set_span_type(handle.span, _AGENT_SPAN_TYPE)
+        _set_span_type(handle.span, str(agent_metadata["span_type"]))
         _set_span_attributes(handle.span, agent_metadata)
         span_token = _push_current_agent_span(handle.span)
         binding = _CURRENT_AGENT_SPAN_STACK.get()[-1]
@@ -760,7 +775,7 @@ class TracedAgentRunnable:
         effective_trace_context, agent_metadata = self._build_effective_trace_context()
         handle = open_traced_span(effective_trace_context)
         handle.request = inputs
-        _set_span_type(handle.span, _AGENT_SPAN_TYPE)
+        _set_span_type(handle.span, str(agent_metadata["span_type"]))
         _set_span_attributes(handle.span, agent_metadata)
         span_token = _push_current_agent_span(handle.span)
         binding = _CURRENT_AGENT_SPAN_STACK.get()[-1]
@@ -818,7 +833,7 @@ class TracedAgentRunnable:
         effective_trace_context, agent_metadata = self._build_effective_trace_context()
         handle = open_traced_span(effective_trace_context)
         handle.request = inputs
-        _set_span_type(handle.span, _AGENT_SPAN_TYPE)
+        _set_span_type(handle.span, str(agent_metadata["span_type"]))
         _set_span_attributes(handle.span, agent_metadata)
         span_token = _push_current_agent_span(handle.span)
         binding = _CURRENT_AGENT_SPAN_STACK.get()[-1]

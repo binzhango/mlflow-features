@@ -458,6 +458,7 @@ class ErgonomicApiTests(unittest.TestCase):
             '{"input_tokens":8,"output_tokens":9,"total_tokens":17}',
         )
         span = self.fake_mlflow.started_spans[-1]["context"]
+        self.assertEqual(span.attributes["mlflow.spanType"], "CHAT_MODEL")
         self.assertEqual(
             span.attributes["mlflow.chat.tokenUsage"],
             {"input_tokens": 8, "output_tokens": 9, "total_tokens": 17},
@@ -683,6 +684,10 @@ class ErgonomicApiTests(unittest.TestCase):
             subagent_span["context"].attributes["mlflow.llm.model"],
             "child-test-model",
         )
+        child_model_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "child-model"
+        )
+        self.assertEqual(child_model_span["context"].attributes["mlflow.spanType"], "CHAT_MODEL")
         self.assertEqual(
             subagent_span["context"].attributes["mlflow.chat.tokenUsage"],
             {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
@@ -1107,14 +1112,31 @@ class EnrichmentTests(unittest.TestCase):
         supervisor_span = next(
             span for span in self.fake_mlflow.started_spans if span["name"] == "deep-supervisor"
         )
-        subagent_span = next(
+        subagent_spans = [
             span for span in self.fake_mlflow.started_spans if span["name"] == "research-subagent"
+        ]
+        self.assertEqual(len(subagent_spans), 2)
+        outer_subagent_span = next(
+            span for span in subagent_spans if span["parent_span_id"] == supervisor_span["span_id"]
         )
-        self.assertEqual(subagent_span["trace_id"], supervisor_span["trace_id"])
-        self.assertEqual(subagent_span["parent_span_id"], supervisor_span["span_id"])
-        self.assertEqual(subagent_span["context"].attributes["agent_name"], "research-subagent")
-        self.assertEqual(subagent_span["context"].attributes["agent_type"], "subagent")
-        self.assertEqual(subagent_span["context"].outputs["content"], "research-result")
+        inner_subagent_span = next(
+            span for span in subagent_spans if span["parent_span_id"] == outer_subagent_span["span_id"]
+        )
+        self.assertEqual(outer_subagent_span["trace_id"], supervisor_span["trace_id"])
+        self.assertEqual(outer_subagent_span["context"].attributes["agent_name"], "research-subagent")
+        self.assertEqual(outer_subagent_span["context"].attributes["agent_type"], "subagent")
+        self.assertEqual(outer_subagent_span["context"].attributes["mlflow.spanType"], "AGENT")
+        self.assertEqual(inner_subagent_span["context"].attributes["mlflow.spanType"], "CHAT_MODEL")
+        self.assertEqual(inner_subagent_span["context"].outputs["content"], "research-result")
+        supervisor_model_spans = [
+            span for span in self.fake_mlflow.started_spans if span["name"] == "deep-supervisor-model"
+        ]
+        self.assertGreaterEqual(len(supervisor_model_spans), 2)
+        self.assertEqual(supervisor_model_spans[0]["context"].attributes["mlflow.spanType"], "TOOL")
+        self.assertEqual(
+            supervisor_model_spans[-1]["context"].attributes["mlflow.spanType"],
+            "CHAT_MODEL",
+        )
 
     def test_auto_trace_agent_retry_attempts_create_multiple_model_spans_but_one_usage_entry(self) -> None:
         flaky_model = _FlakyChatModel(

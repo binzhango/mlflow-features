@@ -24,6 +24,37 @@ except ImportError:  # pragma: no cover - optional dependency at import time
 TraceContextLike = TraceContext | Mapping[str, Any] | None
 _CHAT_TOKEN_USAGE_ATTRIBUTE_KEY = "mlflow.chat.tokenUsage"
 _TOKEN_USAGE_KEYS = ("input_tokens", "output_tokens", "total_tokens")
+_CHAT_MODEL_SPAN_TYPE = "CHAT_MODEL"
+_TOOL_SPAN_TYPE = "TOOL"
+
+
+def _set_span_type(span: Any, span_type: str) -> None:
+    if hasattr(span, "set_span_type"):
+        span.set_span_type(span_type)
+
+
+def _resolve_model_span_type(response: Any) -> str:
+    if isinstance(response, Mapping):
+        if response.get("tool_calls"):
+            return _TOOL_SPAN_TYPE
+        return _CHAT_MODEL_SPAN_TYPE
+
+    tool_calls = getattr(response, "tool_calls", None)
+    if isinstance(tool_calls, list) and tool_calls:
+        return _TOOL_SPAN_TYPE
+
+    message = getattr(response, "message", None)
+    if message is not None and message is not response:
+        return _resolve_model_span_type(message)
+
+    generations = getattr(response, "generations", None)
+    if isinstance(generations, list) and generations:
+        for item in generations:
+            span_type = _resolve_model_span_type(item)
+            if span_type == _TOOL_SPAN_TYPE:
+                return span_type
+
+    return _CHAT_MODEL_SPAN_TYPE
 
 
 def coerce_trace_context(trace_context: TraceContextLike) -> TraceContext | None:
@@ -570,6 +601,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
     ) -> Any:
         handle = open_traced_span(self.trace_context)
         handle.request = messages
+        _set_span_type(handle.span, _CHAT_MODEL_SPAN_TYPE)
         try:
             result = self.runnable._generate(
                 messages,
@@ -577,6 +609,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                 run_manager=run_manager,
                 **kwargs,
             )
+            _set_span_type(handle.span, _resolve_model_span_type(result))
             handle.trace_context = self._apply_dynamic_trace_attributes(
                 inputs=messages,
                 response=result,
@@ -607,6 +640,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
     ) -> Any:
         handle = open_traced_span(self.trace_context)
         handle.request = messages
+        _set_span_type(handle.span, _CHAT_MODEL_SPAN_TYPE)
         try:
             result = await self.runnable._agenerate(
                 messages,
@@ -614,6 +648,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                 run_manager=run_manager,
                 **kwargs,
             )
+            _set_span_type(handle.span, _resolve_model_span_type(result))
             handle.trace_context = self._apply_dynamic_trace_attributes(
                 inputs=messages,
                 response=result,
@@ -645,6 +680,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
     ) -> Any:
         handle = open_traced_span(self.trace_context)
         handle.request = inputs
+        _set_span_type(handle.span, _CHAT_MODEL_SPAN_TYPE)
         try:
             result = self.runnable.invoke(
                 inputs,
@@ -652,6 +688,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                 stop=stop,
                 **kwargs,
             )
+            _set_span_type(handle.span, _resolve_model_span_type(result))
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
@@ -680,6 +717,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
     ) -> Any:
         handle = open_traced_span(self.trace_context)
         handle.request = inputs
+        _set_span_type(handle.span, _CHAT_MODEL_SPAN_TYPE)
         try:
             result = await self.runnable.ainvoke(
                 inputs,
@@ -687,6 +725,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                 stop=stop,
                 **kwargs,
             )
+            _set_span_type(handle.span, _resolve_model_span_type(result))
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
@@ -715,6 +754,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
     ) -> Iterator[Any]:
         handle = open_traced_span(self.trace_context)
         handle.request = inputs
+        _set_span_type(handle.span, _CHAT_MODEL_SPAN_TYPE)
         accumulator = _StreamAccumulator()
 
         try:
@@ -736,6 +776,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                     accumulator.add(chunk)
                     yield chunk
                 result = accumulator.result()
+                _set_span_type(handle.span, _resolve_model_span_type(result))
                 handle.trace_context = self._apply_dynamic_trace_attributes(
                     inputs=inputs,
                     response=result,
@@ -756,6 +797,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
             finally:
                 if handle.error is None and handle.response is None:
                     result = accumulator.result()
+                    _set_span_type(handle.span, _resolve_model_span_type(result))
                     handle.trace_context = self._apply_dynamic_trace_attributes(
                         inputs=inputs,
                         response=result,
@@ -790,6 +832,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
     ) -> AsyncIterator[Any]:
         handle = open_traced_span(self.trace_context)
         handle.request = inputs
+        _set_span_type(handle.span, _CHAT_MODEL_SPAN_TYPE)
         accumulator = _StreamAccumulator()
 
         try:
@@ -810,6 +853,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
                 accumulator.add(chunk)
                 yield chunk
             result = accumulator.result()
+            _set_span_type(handle.span, _resolve_model_span_type(result))
             handle.trace_context = self._apply_dynamic_trace_attributes(inputs=inputs, response=result)
             handle.trace_context = _trace_context_with_token_usage(handle.trace_context, result)
             _set_span_token_usage(handle.span, result)
@@ -827,6 +871,7 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
         finally:
             if handle.error is None and handle.response is None:
                 result = accumulator.result()
+                _set_span_type(handle.span, _resolve_model_span_type(result))
                 handle.trace_context = self._apply_dynamic_trace_attributes(
                     inputs=inputs,
                     response=result,
@@ -844,6 +889,8 @@ class TracedChatModel(BaseChatModel):  # type: ignore[misc,valid-type]
 
     def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any) -> Any:
         bound = self.runnable.bind_tools(tools, tool_choice=tool_choice, **kwargs)
+        if _is_base_chat_model_like(bound):
+            return wrap_llm(bound, self.trace_context, config=self.base_config)
         return wrap_runnable(bound, self.trace_context, config=self.base_config)
 
     def with_structured_output(
