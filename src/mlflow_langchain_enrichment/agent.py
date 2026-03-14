@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Any, AsyncIterator, Iterator, Mapping
 
-from .auto import accumulate_current_trace_token_usage, close_traced_span, open_traced_span
+from .auto import (
+    accumulate_current_trace_token_usage,
+    close_traced_span,
+    get_current_trace_context,
+    open_traced_span,
+)
 from .enrichment import TraceContext
 
 try:
@@ -188,6 +193,32 @@ def _resolve_agent_span_type(
     return _AGENT_SPAN_TYPE
 
 
+def _with_trace_name(trace_context: TraceContext | None, trace_name: str) -> TraceContext | None:
+    if trace_context is None:
+        return None
+    return TraceContext(
+        tags=dict(trace_context.tags),
+        metadata=dict(trace_context.metadata),
+        span_metadata=dict(trace_context.span_metadata),
+        run_tags=dict(trace_context.run_tags),
+        user_id=trace_context.user_id,
+        session_id=trace_context.session_id,
+        client_request_id=trace_context.client_request_id,
+        mlflow_run_name=trace_context.mlflow_run_name,
+        run_description=trace_context.run_description,
+        ensure_run=trace_context.ensure_run,
+        request_preview=trace_context.request_preview,
+        response_preview=trace_context.response_preview,
+        request_preview_builder=trace_context.request_preview_builder,
+        response_preview_builder=trace_context.response_preview_builder,
+        tags_builder=trace_context.tags_builder,
+        metadata_builder=trace_context.metadata_builder,
+        preview_limit=trace_context.preview_limit,
+        trace_name=trace_name,
+        capture_root_span_io=trace_context.capture_root_span_io,
+    )
+
+
 def _resolve_model_name(
     *,
     trace_context: TraceContext,
@@ -303,6 +334,28 @@ def _build_agent_span_output(result: Any, binding: AgentSpanBinding | None) -> A
     if binding is not None and "usage_metadata" not in enriched and binding.token_usage:
         enriched["usage_metadata"] = dict(binding.token_usage)
     return enriched
+
+
+def _normalize_task_result_output(result: Any) -> Any:
+    update = None
+    if isinstance(result, Mapping):
+        update = result.get("update")
+    else:
+        update = getattr(result, "update", None)
+
+    if isinstance(update, Mapping):
+        messages = update.get("messages")
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                content = getattr(message, "content", None)
+                if isinstance(content, str):
+                    return {"content": content}
+                if isinstance(message, Mapping):
+                    mapped_content = message.get("content")
+                    if isinstance(mapped_content, str):
+                        return {"content": mapped_content}
+
+    return _build_agent_span_output(result, None)
 
 
 def _coerce_usage_int(value: Any) -> int | None:
@@ -441,6 +494,65 @@ def _extract_task_subagent_graphs(func: Any) -> dict[str, Any] | None:
     return None
 
 
+def _wrap_tool_for_tracing(tool: Any) -> None:
+    if getattr(tool, "_mlflow_langchain_enrichment_traced", False):
+        return
+
+    original_sync = getattr(tool, "func", None)
+    original_async = getattr(tool, "coroutine", None)
+    tool_name = getattr(tool, "name", None)
+    if not isinstance(tool_name, str) or not tool_name:
+        tool_name = type(tool).__name__
+
+    def _build_handle() -> Any | None:
+        current_trace_context = get_current_trace_context()
+        if current_trace_context is None:
+            return None
+        handle = open_traced_span(_with_trace_name(current_trace_context, tool_name))
+        _set_span_type(handle.span, "TOOL")
+        return handle
+
+    if callable(original_sync):
+        @wraps(original_sync)
+        def traced_sync(*args: Any, **kwargs: Any) -> Any:
+            handle = _build_handle()
+            if handle is None:
+                return original_sync(*args, **kwargs)
+            handle.request = {"args": args, "kwargs": kwargs}
+            try:
+                result = original_sync(*args, **kwargs)
+                handle.response = result
+                return result
+            except BaseException as exc:
+                handle.error = exc
+                raise
+            finally:
+                close_traced_span(handle)
+
+        tool.func = traced_sync
+
+    if callable(original_async):
+        @wraps(original_async)
+        async def traced_async(*args: Any, **kwargs: Any) -> Any:
+            handle = _build_handle()
+            if handle is None:
+                return await original_async(*args, **kwargs)
+            handle.request = {"args": args, "kwargs": kwargs}
+            try:
+                result = await original_async(*args, **kwargs)
+                handle.response = result
+                return result
+            except BaseException as exc:
+                handle.error = exc
+                raise
+            finally:
+                close_traced_span(handle)
+
+        tool.coroutine = traced_async
+
+    setattr(tool, "_mlflow_langchain_enrichment_traced", True)
+
+
 def _wrap_task_tool_for_pending_child_context(tool: Any) -> None:
     original_sync = getattr(tool, "func", None)
     original_async = getattr(tool, "coroutine", None)
@@ -472,14 +584,66 @@ def _wrap_task_tool_for_pending_child_context(tool: Any) -> None:
             runtime = args[2]
         return subagent_type if isinstance(subagent_type, str) else None, runtime
 
+    def _open_subagent_handle(
+        *,
+        subagent_type: str | None,
+        runtime: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[Any | None, contextvars.Token[AgentExecutionContext | None] | None]:
+        if not isinstance(subagent_type, str) or not subagent_type:
+            return None, None
+
+        current_trace_context = get_current_trace_context()
+        if current_trace_context is None:
+            return None, None
+
+        handle = open_traced_span(_with_trace_name(current_trace_context, subagent_type))
+        handle.request = {"args": args, "kwargs": kwargs}
+        _set_span_type(handle.span, _AGENT_SPAN_TYPE)
+        tool_call_id = getattr(runtime, "tool_call_id", None)
+        _set_span_attributes(
+            handle.span,
+            {
+                "agent_name": subagent_type,
+                "agent_type": "subagent",
+                "tool_call_id": tool_call_id if isinstance(tool_call_id, str) else None,
+            },
+        )
+        execution_token = _CURRENT_AGENT_EXECUTION.set(
+            AgentExecutionContext(
+                agent_name=subagent_type,
+                agent_type="subagent",
+                tool_call_id=tool_call_id if isinstance(tool_call_id, str) else None,
+            )
+        )
+        return handle, execution_token
+
     if callable(original_sync):
         @wraps(original_sync)
         def wrapped_sync(*args: Any, **kwargs: Any) -> Any:
             subagent_type, runtime = _extract_call_details(args, kwargs)
             token = _set_pending_context(subagent_type=subagent_type, runtime=runtime)
+            handle, execution_token = _open_subagent_handle(
+                subagent_type=subagent_type,
+                runtime=runtime,
+                args=args,
+                kwargs=kwargs,
+            )
             try:
-                return original_sync(*args, **kwargs)
+                result = original_sync(*args, **kwargs)
+                if handle is not None:
+                    handle.response = _normalize_task_result_output(result)
+                return result
+            except BaseException as exc:
+                if handle is not None:
+                    handle.error = exc
+                raise
             finally:
+                if handle is not None:
+                    close_traced_span(handle)
+                if execution_token is not None:
+                    _CURRENT_AGENT_EXECUTION.reset(execution_token)
                 if token is not None:
                     _PENDING_CHILD_AGENT.reset(token)
 
@@ -490,9 +654,26 @@ def _wrap_task_tool_for_pending_child_context(tool: Any) -> None:
         async def wrapped_async(*args: Any, **kwargs: Any) -> Any:
             subagent_type, runtime = _extract_call_details(args, kwargs)
             token = _set_pending_context(subagent_type=subagent_type, runtime=runtime)
+            handle, execution_token = _open_subagent_handle(
+                subagent_type=subagent_type,
+                runtime=runtime,
+                args=args,
+                kwargs=kwargs,
+            )
             try:
-                return await original_async(*args, **kwargs)
+                result = await original_async(*args, **kwargs)
+                if handle is not None:
+                    handle.response = _normalize_task_result_output(result)
+                return result
+            except BaseException as exc:
+                if handle is not None:
+                    handle.error = exc
+                raise
             finally:
+                if handle is not None:
+                    close_traced_span(handle)
+                if execution_token is not None:
+                    _CURRENT_AGENT_EXECUTION.reset(execution_token)
                 if token is not None:
                     _PENDING_CHILD_AGENT.reset(token)
 
@@ -565,6 +746,8 @@ def _prepare_compiled_agent(
                             cache=cache,
                         )
                 _wrap_task_tool_for_pending_child_context(task_tool)
+            for tool in tools_by_name.values():
+                _wrap_tool_for_tracing(tool)
 
     return _compile_builder(builder, agent)
 
@@ -691,6 +874,20 @@ class TracedAgentRunnable:
         )
         return execution_token, pending_token
 
+    def _should_skip_nested_span(self, agent_metadata: Mapping[str, Any]) -> bool:
+        current_execution = _CURRENT_AGENT_EXECUTION.get()
+        if current_execution is None:
+            return False
+        if current_execution.agent_name != str(agent_metadata["agent_name"]):
+            return False
+        current_tool_call_id = current_execution.tool_call_id
+        requested_tool_call_id = (
+            str(agent_metadata["tool_call_id"])
+            if agent_metadata.get("tool_call_id") is not None
+            else None
+        )
+        return current_tool_call_id == requested_tool_call_id
+
     def invoke(
         self,
         inputs: Any,
@@ -699,6 +896,12 @@ class TracedAgentRunnable:
         **kwargs: Any,
     ) -> Any:
         effective_trace_context, agent_metadata = self._build_effective_trace_context()
+        if self._should_skip_nested_span(agent_metadata):
+            return self.runnable.invoke(
+                inputs,
+                config=self._build_config(agent_metadata, config),
+                **kwargs,
+            )
         handle = open_traced_span(effective_trace_context)
         handle.request = inputs
         _set_span_type(handle.span, str(agent_metadata["span_type"]))
@@ -736,6 +939,12 @@ class TracedAgentRunnable:
         **kwargs: Any,
     ) -> Any:
         effective_trace_context, agent_metadata = self._build_effective_trace_context()
+        if self._should_skip_nested_span(agent_metadata):
+            return await self.runnable.ainvoke(
+                inputs,
+                config=self._build_config(agent_metadata, config),
+                **kwargs,
+            )
         handle = open_traced_span(effective_trace_context)
         handle.request = inputs
         _set_span_type(handle.span, str(agent_metadata["span_type"]))
@@ -773,6 +982,12 @@ class TracedAgentRunnable:
         **kwargs: Any,
     ) -> Iterator[Any]:
         effective_trace_context, agent_metadata = self._build_effective_trace_context()
+        if self._should_skip_nested_span(agent_metadata):
+            return self.runnable.stream(
+                inputs,
+                config=self._build_config(agent_metadata, config),
+                **kwargs,
+            )
         handle = open_traced_span(effective_trace_context)
         handle.request = inputs
         _set_span_type(handle.span, str(agent_metadata["span_type"]))
@@ -831,6 +1046,14 @@ class TracedAgentRunnable:
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
         effective_trace_context, agent_metadata = self._build_effective_trace_context()
+        if self._should_skip_nested_span(agent_metadata):
+            async for chunk in self.runnable.astream(
+                inputs,
+                config=self._build_config(agent_metadata, config),
+                **kwargs,
+            ):
+                yield chunk
+            return
         handle = open_traced_span(effective_trace_context)
         handle.request = inputs
         _set_span_type(handle.span, str(agent_metadata["span_type"]))

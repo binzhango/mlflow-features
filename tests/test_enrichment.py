@@ -31,6 +31,7 @@ from langchain_core.callbacks.manager import CallbackManager
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
 
 from mlflow_langchain_enrichment.auto import (
     RootTraceHandle,
@@ -286,6 +287,44 @@ class _DeepAgentTaskCallingChatModel(BaseChatModel):
             generations=[
                 ChatGeneration(
                     message=AIMessage(content="deepagent-final"),
+                )
+            ]
+        )
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return self
+
+
+class _DeepAgentTaskAndToolChatModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "deepagent-task-tool-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        saw_tool_response = any(isinstance(message, ToolMessage) for message in messages)
+        if not saw_tool_response:
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": "lookup_fact",
+                                    "args": {"topic": "research"},
+                                    "id": "lookup-call-1",
+                                    "type": "tool_call",
+                                }
+                            ],
+                        )
+                    )
+                ]
+            )
+
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(content="research-result"),
                 )
             ]
         )
@@ -671,7 +710,11 @@ class ErgonomicApiTests(unittest.TestCase):
         subagent_span = next(
             span for span in self.fake_mlflow.started_spans if span["name"] == "billing-subagent"
         )
-        self.assertEqual(subagent_span["parent_span_id"], supervisor_span["span_id"])
+        tool_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "ask_child_agent"
+        )
+        self.assertEqual(tool_span["context"].attributes["mlflow.spanType"], "TOOL")
+        self.assertEqual(subagent_span["parent_span_id"], tool_span["span_id"])
         self.assertEqual(subagent_span["context"].attributes["agent_name"], "billing-subagent")
         self.assertEqual(subagent_span["context"].attributes["agent_type"], "subagent")
         self.assertEqual(subagent_span["context"].attributes["mlflow.spanType"], "AGENT")
@@ -1047,11 +1090,16 @@ class EnrichmentTests(unittest.TestCase):
 
         task_tool = traced_agent.runnable.builder.nodes["tools"].runnable._tools_by_name["task"]
         subagent_graphs = None
-        for func in (getattr(task_tool.func, "__wrapped__", task_tool.func), getattr(task_tool.coroutine, "__wrapped__", task_tool.coroutine)):
-            for name, cell in zip(func.__code__.co_freevars, func.__closure__ or [], strict=False):
-                if name == "subagent_graphs":
-                    subagent_graphs = cell.cell_contents
+        for func in (task_tool.func, task_tool.coroutine):
+            current = func
+            while current is not None:
+                for name, cell in zip(current.__code__.co_freevars, current.__closure__ or [], strict=False):
+                    if name == "subagent_graphs":
+                        subagent_graphs = cell.cell_contents
+                        break
+                if subagent_graphs is not None:
                     break
+                current = getattr(current, "__wrapped__", None)
             if subagent_graphs is not None:
                 break
 
@@ -1065,6 +1113,12 @@ class EnrichmentTests(unittest.TestCase):
         )
 
     def test_auto_trace_agent_deepagents_run_emits_named_subagent_child_span(self) -> None:
+        @tool
+        def lookup_fact(topic: str) -> str:
+            """Return a short research fact."""
+
+            return f"fact:{topic}"
+
         traced_agent = auto_trace_agent(
             create_deep_agent(
                 model=auto_trace_llm(
@@ -1080,20 +1134,12 @@ class EnrichmentTests(unittest.TestCase):
                         "description": "Research worker",
                         "system_prompt": "Do research",
                         "model": auto_trace_llm(
-                            _StaticChatModel(
-                                response_text="research-result",
-                                model_name="research-model",
-                                usage_metadata={
-                                    "input_tokens": 3,
-                                    "output_tokens": 4,
-                                    "total_tokens": 7,
-                                },
-                            ),
+                            _DeepAgentTaskAndToolChatModel(),
                             session_id="session-deep-run",
                             user_id="user-deep-run",
                             trace_name="research-model",
                         ),
-                        "tools": [],
+                        "tools": [lookup_fact],
                     }
                 ],
                 name="deep-supervisor",
@@ -1116,19 +1162,24 @@ class EnrichmentTests(unittest.TestCase):
         subagent_spans = [
             span for span in self.fake_mlflow.started_spans if span["name"] == "research-subagent"
         ]
-        self.assertEqual(len(subagent_spans), 2)
-        outer_subagent_span = next(
-            span for span in subagent_spans if span["parent_span_id"] == supervisor_span["span_id"]
+        self.assertEqual(len(subagent_spans), 1)
+        subagent_span = subagent_spans[0]
+        task_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "task"
         )
-        inner_subagent_span = next(
-            span for span in subagent_spans if span["parent_span_id"] == outer_subagent_span["span_id"]
+        self.assertEqual(task_span["context"].attributes["mlflow.spanType"], "TOOL")
+        self.assertEqual(task_span["parent_span_id"], supervisor_span["span_id"])
+        self.assertEqual(subagent_span["parent_span_id"], task_span["span_id"])
+        self.assertEqual(subagent_span["trace_id"], supervisor_span["trace_id"])
+        self.assertEqual(subagent_span["context"].attributes["agent_name"], "research-subagent")
+        self.assertEqual(subagent_span["context"].attributes["agent_type"], "subagent")
+        self.assertEqual(subagent_span["context"].attributes["mlflow.spanType"], "AGENT")
+        self.assertEqual(subagent_span["context"].outputs["content"], "research-result")
+        lookup_span = next(
+            span for span in self.fake_mlflow.started_spans if span["name"] == "lookup_fact"
         )
-        self.assertEqual(outer_subagent_span["trace_id"], supervisor_span["trace_id"])
-        self.assertEqual(outer_subagent_span["context"].attributes["agent_name"], "research-subagent")
-        self.assertEqual(outer_subagent_span["context"].attributes["agent_type"], "subagent")
-        self.assertEqual(outer_subagent_span["context"].attributes["mlflow.spanType"], "AGENT")
-        self.assertEqual(inner_subagent_span["context"].attributes["mlflow.spanType"], "AGENT")
-        self.assertEqual(inner_subagent_span["context"].outputs["content"], "research-result")
+        self.assertEqual(lookup_span["context"].attributes["mlflow.spanType"], "TOOL")
+        self.assertEqual(lookup_span["parent_span_id"], subagent_span["span_id"])
         supervisor_model_spans = [
             span for span in self.fake_mlflow.started_spans if span["name"] == "deep-supervisor-model"
         ]
@@ -1138,6 +1189,11 @@ class EnrichmentTests(unittest.TestCase):
             supervisor_model_spans[-1]["context"].attributes["mlflow.spanType"],
             "CHAT_MODEL",
         )
+        research_model_spans = [
+            span for span in self.fake_mlflow.started_spans if span["name"] == "research-model"
+        ]
+        self.assertEqual(research_model_spans[0]["context"].attributes["mlflow.spanType"], "TOOL")
+        self.assertEqual(research_model_spans[-1]["context"].attributes["mlflow.spanType"], "CHAT_MODEL")
 
     def test_auto_trace_agent_retry_attempts_create_multiple_model_spans_but_one_usage_entry(self) -> None:
         flaky_model = _FlakyChatModel(
